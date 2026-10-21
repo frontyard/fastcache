@@ -74,6 +74,57 @@ into the cache while streaming it to the client.
 | `honor_request_cache_control` | off                    | Honor client `no-cache`/`no-store`/`Pragma` as a bypass (default ignores them, nginx-style) |
 | `promote_below`               | `16KB`                 | Only bodies up to this size promote to the RAM tier; larger ones always serve via sendfile. `0` = never promote |
 
+### Examples
+
+```caddyfile
+# Key on path + one query param, ignoring all others
+cache_key {http.request.host}{http.request.uri.path}?lang={query.lang}
+
+# Cache only responses the upstream opted into
+match_header X-Cacheable yes true
+
+# One variant per compression scheme and device class
+vary Accept-Encoding X-Device-Class
+
+# Purge allowed from a private range plus one admin host
+purge_allow 10.0.0.0/8 192.168.1.10
+
+# RAM-only: small hot set, nothing on disk, cold after restart
+disk_size 0
+
+# Disk-only: bodies never occupy Go heap; every hit sendfiles
+memory_size 0
+
+# Restore always-promote behavior (promotion limit above the RAM budget)
+promote_below 1GB
+```
+
+Each `fastcache` block is an independent instance, so tiers can be split
+per URL shape — small responses take the RAM path while large ones stay
+on sendfile:
+
+```caddyfile
+https://example.com {
+    route /live/*.m3u8 {
+        fastcache {
+            path        /var/cache/fc-playlists
+            memory_size 32MB
+            disk_size   0           # playlists live in RAM only
+            ttl         10s
+        }
+        reverse_proxy origin:8000
+    }
+    route /live/* {
+        fastcache {
+            path        /var/cache/fc-segments
+            memory_size 0           # segments serve via sendfile only
+            disk_size   50GB
+        }
+        reverse_proxy origin:8000
+    }
+}
+```
+
 ### PURGE
 
 `PURGE <uri>` evicts all variants of a key. Without `purge_allow` only loopback
