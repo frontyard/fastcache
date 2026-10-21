@@ -1,0 +1,23 @@
+{
+    admin off
+    auto_https off
+
+    cache {
+        simplefs {
+            configuration {
+                path /tmp/simplefs-bench-cache
+                directory_size 1GB
+                disable_compression true
+                disable_touch_on_hit true
+            }
+        }
+    }
+}
+
+# souin + simplefs baseline (requires ../storages and a caddy-souin build).
+http://localhost:9080 {
+    route {
+        cache
+        reverse_proxy localhost:9081
+    }
+}

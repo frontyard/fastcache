@@ -1,0 +1,24 @@
+{
+    admin off
+    auto_https off
+}
+
+# fastcache — the plugin under test. Hit path: RAM body or sendfile.
+http://localhost:9083 {
+    route {
+        fastcache {
+            path /tmp/fastcache-bench-cache
+            memory_size 64MB
+            disk_size 1GB
+        }
+        reverse_proxy localhost:9081
+    }
+}
+
+# Plain file_server on a static 64KiB body — the Go net/http ceiling any
+# caddy-side cache can hope to reach (Phase 0 of the plan).
+http://localhost:9084 {
+    root * /tmp/fastcache-bench-www
+    rewrite * /body.bin
+    file_server
+}
