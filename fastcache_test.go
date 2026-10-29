@@ -2817,13 +2817,11 @@ func TestMissFollowerNoHerd(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
 			_ = fc.ServeHTTP(httptest.NewRecorder(), r, next)
-		}()
+		})
 	}
 	close(start)
 
@@ -2865,11 +2863,9 @@ func TestSIEFollowerCoalesce(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			get(t, fc, "/", nil, next)
-		}()
+		})
 	}
 
 	time.Sleep(50 * time.Millisecond)
@@ -3086,7 +3082,7 @@ func TestRefresh304Deleted(t *testing.T) {
 	var calls atomic.Int64
 	release := make(chan struct{})
 
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		n := calls.Add(1)
 		w.Header().Set("Cache-Control", "public") // freshness = configured TTL (50ms)
 		w.Header().Set("ETag", `"v1"`)
