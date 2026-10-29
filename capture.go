@@ -2,6 +2,7 @@ package fastcache
 
 import (
 	"bufio"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -242,9 +243,7 @@ func (cw *captureWriter) WriteHeader(status int) {
 	if !cw.decided && status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
 		// Informational response — flush its headers downstream and keep
 		// buffering for the final WriteHeader.
-		for k, vv := range cw.hdr {
-			cw.rw.Header()[k] = vv
-		}
+		maps.Copy(cw.rw.Header(), cw.hdr)
 		cw.rw.WriteHeader(status)
 
 		return

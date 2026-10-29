@@ -102,7 +102,7 @@ func get(t *testing.T, fc *FastCache, target string, headers http.Header, next c
 
 // countingUpstream returns a next handler serving body, counting calls.
 func countingUpstream(counter *atomic.Int64, body []byte, headers http.Header) caddyhttp.Handler {
-	return handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	return handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		counter.Add(1)
 		for k, vv := range headers {
 			for _, v := range vv {
@@ -169,7 +169,7 @@ func TestUncacheableResponses(t *testing.T) {
 
 			var calls atomic.Int64
 
-			next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 				calls.Add(1)
 				for k, vv := range tc.headers {
 					for _, v := range vv {
@@ -352,7 +352,7 @@ func TestPurgeAbortsInflightCommit(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		w.WriteHeader(http.StatusOK)
@@ -395,7 +395,7 @@ func TestMultiValuedHeaders(t *testing.T) {
 	fc := newTestCache(t, func(fc *FastCache) { fc.Vary = []string{"X-A", "X-B"} })
 
 	var calls atomic.Int64
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 		w.Header()["Cache-Control"] = []string{"public", "max-age=3600"}
 		w.Header()["Vary"] = []string{"X-A", "X-B"}
@@ -512,7 +512,7 @@ func TestVaryUnlistedHeader(t *testing.T) {
 
 	var calls atomic.Int64
 
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		w.Header().Set("Vary", "X-Custom-Header")
@@ -577,7 +577,7 @@ func TestVaryMultiValue(t *testing.T) {
 
 	var calls atomic.Int64
 
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		w.Header().Set("Vary", "X-Lang")
@@ -740,7 +740,7 @@ func TestSingleflight(t *testing.T) {
 
 	release := make(chan struct{})
 
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 		<-release
 		w.Header().Set("Cache-Control", "public, max-age=3600")
@@ -974,7 +974,7 @@ func TestStaleWhileRevalidate(t *testing.T) {
 
 	var calls atomic.Int64
 	body := "v1"
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 		w.Header().Set("Cache-Control", "public, max-age=1")
 		w.WriteHeader(http.StatusOK)
@@ -1245,7 +1245,7 @@ func TestTruncatedBodyNotCached(t *testing.T) {
 
 			var calls atomic.Int64
 
-			next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 				calls.Add(1)
 				w.Header().Set("Cache-Control", "public, max-age=3600")
 				if declared {
@@ -1280,7 +1280,7 @@ func TestHandlerErrorNotCached(t *testing.T) {
 
 	var calls atomic.Int64
 
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		_, _ = w.Write([]byte("partial"))
@@ -1385,7 +1385,7 @@ func TestHeuristicStatusCaching(t *testing.T) {
 
 	var calls atomic.Int64
 
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte("nope"))
@@ -1430,7 +1430,7 @@ func TestFollowerCancel(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{})
 
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		close(started)
 		<-release
 		_, _ = w.Write([]byte("x"))
@@ -1510,7 +1510,7 @@ func TestStaleIfError(t *testing.T) {
 	var calls atomic.Int64
 	fail := 0 // 0 = ok, 1 = 5xx, 2 = handler error
 	body := "v1"
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 
 		switch fail {
@@ -1568,7 +1568,7 @@ func TestStaleFallbackHeaderIsolation(t *testing.T) {
 
 	var calls atomic.Int64
 	fail := 0 // 0 = ok, 1 = 5xx, 2 = handler error
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 
 		if fail != 0 {
@@ -1609,7 +1609,7 @@ func TestHopByHopNotStored(t *testing.T) {
 	fc := newTestCache(t, nil)
 
 	var calls atomic.Int64
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		w.Header().Set("Connection", "X-Internal")
@@ -1666,7 +1666,7 @@ func TestInformationalPassthrough(t *testing.T) {
 	fc := newTestCache(t, nil)
 
 	var calls atomic.Int64
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		calls.Add(1)
 		w.Header().Set("Link", "</style.css>; rel=preload")
 		w.WriteHeader(http.StatusEarlyHints)
@@ -2016,7 +2016,7 @@ func TestMustRevalidate(t *testing.T) {
 	var body atomic.Value
 	body.Store("v1")
 
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		if fail.Load() {
 			w.WriteHeader(http.StatusBadGateway)
 			return nil
@@ -2329,7 +2329,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 func TestCaptureWriterInterfaces(t *testing.T) {
 	fc := newTestCache(t, nil)
 
-	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		f, ok := w.(http.Flusher)
 		if !ok {
 			return errors.New("writer lost http.Flusher")

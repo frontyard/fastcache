@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -542,9 +543,7 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 	h := w.Header()
 
 	hdrs := *e.headers.Load()
-	for k, vv := range hdrs {
-		h[k] = vv
-	}
+	maps.Copy(h, hdrs)
 
 	h["Cache-Status"] = []string{"fastcache; " + strings.Join(cs, "; ")}
 
@@ -595,10 +594,7 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 
 // ttlParam is the Cache-Status ttl parameter: remaining freshness, seconds.
 func ttlParam(e *entry) string {
-	rem := e.expiresAt.Load() - time.Now().UnixNano()
-	if rem < 0 {
-		rem = 0
-	}
+	rem := max(e.expiresAt.Load()-time.Now().UnixNano(), 0)
 
 	return "ttl=" + strconv.FormatInt(rem/int64(time.Second), 10)
 }
@@ -618,7 +614,7 @@ func etagMatches(inm, etag string) bool {
 	// W/"x" and "x" are equivalent.
 	etag = strings.TrimPrefix(etag, "W/")
 
-	for _, t := range strings.Split(inm, ",") {
+	for t := range strings.SplitSeq(inm, ",") {
 		if v := strings.TrimPrefix(strings.TrimSpace(t), "W/"); v == etag || v == "*" {
 			return true
 		}

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -125,12 +126,12 @@ type expiryItem struct {
 
 type expiryHeap []expiryItem
 
-func (h expiryHeap) Len() int            { return len(h) }
-func (h expiryHeap) Less(i, j int) bool  { return h[i].staleAt < h[j].staleAt }
-func (h expiryHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *expiryHeap) Push(x interface{}) { *h = append(*h, x.(expiryItem)) }
+func (h expiryHeap) Len() int           { return len(h) }
+func (h expiryHeap) Less(i, j int) bool { return h[i].staleAt < h[j].staleAt }
+func (h expiryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *expiryHeap) Push(x any)        { *h = append(*h, x.(expiryItem)) }
 
-func (h *expiryHeap) Pop() interface{} {
+func (h *expiryHeap) Pop() any {
 	old := *h
 	n := len(old)
 	item := old[n-1]
@@ -284,7 +285,7 @@ func (ix *index) commit(e *entry) {
 	// deserve a different representation. Drop the whole mapping.
 	if !slices.Equal(m.varyHeaders, e.varyH) {
 		var orphans []*entry
-		m.variants.Range(func(_, ev interface{}) bool {
+		m.variants.Range(func(_, ev any) bool {
 			orphans = append(orphans, ev.(*entry))
 			return true
 		})
@@ -327,7 +328,7 @@ func (ix *index) deleteEntry(e *entry) bool {
 		m.variants.CompareAndDelete(e.varyK, e)
 
 		empty := true
-		m.variants.Range(func(_, _ interface{}) bool { empty = false; return false })
+		m.variants.Range(func(_, _ any) bool { empty = false; return false })
 
 		if empty {
 			ix.mappings.Delete(e.baseKey)
@@ -412,7 +413,7 @@ func (ix *index) stop() {
 func (ix *index) candidatesBySeq(keep func(*entry) bool) []*entry {
 	var out []*entry
 
-	ix.entries.Range(func(_, v interface{}) bool {
+	ix.entries.Range(func(_, v any) bool {
 		if e := v.(*entry); keep == nil || keep(e) {
 			out = append(out, e)
 		}
@@ -824,12 +825,8 @@ func (ix *index) rebuild() error {
 func (ix *index) refresh304(e *entry, h http.Header) {
 	old := *e.headers.Load()
 	merged := make(http.Header, len(old)+len(h))
-	for k, vv := range old {
-		merged[k] = vv
-	}
-	for k, vv := range cacheableHeaders(h) {
-		merged[k] = vv
-	}
+	maps.Copy(merged, old)
+	maps.Copy(merged, cacheableHeaders(h))
 	e.headers.Store(&merged)
 
 	now := time.Now()
@@ -896,7 +893,7 @@ func (ix *index) purge(base, reason string) int {
 
 	var toDelete []*entry
 
-	m.variants.Range(func(_, ev interface{}) bool {
+	m.variants.Range(func(_, ev any) bool {
 		toDelete = append(toDelete, ev.(*entry))
 
 		return true
@@ -943,9 +940,14 @@ func varyKey(r *http.Request, headers []string) string {
 
 	var b strings.Builder
 	for _, h := range headers {
-		fmt.Fprintf(&b, "%d:%s", len(h), h)
+		b.WriteString(strconv.Itoa(len(h)))
+		b.WriteByte(':')
+		b.WriteString(h)
 		v := strings.Join(r.Header.Values(h), ",")
-		fmt.Fprintf(&b, "%d:%s;", len(v), v)
+		b.WriteString(strconv.Itoa(len(v)))
+		b.WriteByte(':')
+		b.WriteString(v)
+		b.WriteByte(';')
 	}
 
 	return b.String()

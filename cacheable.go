@@ -2,6 +2,7 @@ package fastcache
 
 import (
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -71,7 +72,7 @@ func responseCC(h http.Header) map[string]string {
 	}
 
 	m := make(map[string]string)
-	for _, dir := range strings.Split(cc, ",") {
+	for dir := range strings.SplitSeq(cc, ",") {
 		dir = strings.TrimSpace(dir)
 		if k, v, ok := strings.Cut(dir, "="); ok {
 			m[strings.ToLower(strings.TrimSpace(k))] = strings.Trim(strings.TrimSpace(v), `"`)
@@ -102,15 +103,7 @@ func responseCacheable(ix *index, r *http.Request, status int, h http.Header) (f
 	// match_header rules: when configured, every named response header must
 	// carry one of the allowed values, else the response is not stored.
 	for name, vals := range ix.matchHeaders {
-		got := h.Get(name)
-		ok := false
-		for _, v := range vals {
-			if got == v {
-				ok = true
-				break
-			}
-		}
-		if !ok {
+		if !slices.Contains(vals, h.Get(name)) {
 			return 0, 0, nil, false, false
 		}
 	}
@@ -140,7 +133,7 @@ func responseCacheable(ix *index, r *http.Request, status int, h http.Header) (f
 			allowed[http.CanonicalHeaderKey(v)] = true
 		}
 
-		for _, v := range strings.Split(vary, ",") {
+		for v := range strings.SplitSeq(vary, ",") {
 			name := http.CanonicalHeaderKey(strings.TrimSpace(v))
 			if name == "" {
 				continue
@@ -218,7 +211,7 @@ func connHeaderTokens(h http.Header) map[string]bool {
 	var out map[string]bool
 
 	for _, line := range h.Values("Connection") {
-		for _, tok := range strings.Split(line, ",") {
+		for tok := range strings.SplitSeq(line, ",") {
 			if name := http.CanonicalHeaderKey(strings.TrimSpace(tok)); name != "" {
 				if out == nil {
 					out = map[string]bool{}
