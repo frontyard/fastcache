@@ -25,7 +25,7 @@ type captureWriter struct {
 	next caddyhttp.Handler
 
 	status    int
-	headers   http.Header
+	hdr       http.Header // upstream's headers, buffered — see Header()
 	cacheable bool
 	decided   bool
 	merged304 bool // revalidation answered 304: headers merged into reval
@@ -40,8 +40,9 @@ type captureWriter struct {
 	bodySize int64
 	declared int64 // upstream Content-Length, -1 if absent
 	failed   bool
-	wrote    bool // headers/body already committed to the client
-	swallow  bool // a stale fallback was served; drop upstream output
+	wrote    bool   // headers/body already committed to the client
+	swallow  bool   // a stale fallback was served; drop upstream output
+	purgeAt  uint64 // purgeSeq snapshot at capture start; a bump aborts the commit
 
 	// fallback is a stale entry to serve when upstream fails (stale_if_error).
 	fallback *entry
@@ -49,6 +50,12 @@ type captureWriter struct {
 	// reval is the stored entry being conditionally revalidated: a 304
 	// merges into it instead of committing a new body.
 	reval *entry
+
+	// ownVal is set when the revalidation carried the stored validators —
+	// or the client's If-None-Match already names the stored ETag — so a
+	// 304 proves OUR entry fresh and may merge. When the client sent other
+	// validators, a 304 only proves their copy fresh: it forwards unmerged.
+	ownVal bool
 
 	// origReq is the client's original request when req was rewritten for
 	// revalidation — stale/304 responses are served against the client's
@@ -66,10 +73,16 @@ type captureWriter struct {
 }
 
 func newCaptureWriter(fc *FastCache, rw http.ResponseWriter, r *http.Request, base string) *captureWriter {
-	return &captureWriter{rw: rw, ix: fc.idx, fc: fc, req: r, base: base, status: http.StatusOK, declared: -1}
+	return &captureWriter{rw: rw, ix: fc.idx, fc: fc, req: r, base: base, status: http.StatusOK, declared: -1,
+		hdr: http.Header{}, purgeAt: fc.idx.purgeSeq.Load()}
 }
 
-func (cw *captureWriter) Header() http.Header { return cw.rw.Header() }
+// Header returns a private buffer, not the client's live header map: a
+// swallowed response (304 merge, stale fallback) or a failed handler must
+// never leak its headers into what gets served. decide() copies them into
+// the real writer only when the upstream response is committed to the
+// client.
+func (cw *captureWriter) Header() http.Header { return cw.hdr }
 
 // decide runs on the first WriteHeader (or implicit 200): it evaluates
 // cacheability and, when positive, opens the temp file and writes the meta
@@ -86,11 +99,10 @@ func (cw *captureWriter) decide(status int) {
 	// Conditional revalidation (RFC 9111 §4.3.4): upstream kept the body —
 	// merge the new headers and freshness into the stored entry and serve
 	// it, swallowing the upstream output.
-	if status == http.StatusNotModified && cw.reval != nil {
+	if status == http.StatusNotModified && cw.reval != nil && cw.ownVal {
 		cw.swallow = true
 		cw.merged304 = true
-		stripHopHeaders(cw.rw.Header())
-		cw.ix.refresh304(cw.reval, cw.rw.Header())
+		cw.ix.refresh304(cw.reval, cw.hdr)
 		_ = cw.fc.serveEntry(cw.rw, serveReq, cw.reval, cw.next, "hit")
 
 		return
@@ -102,14 +114,26 @@ func (cw *captureWriter) decide(status int) {
 	// (5xx is uncacheable anyway).
 	if cw.fallback != nil && status >= 500 && !cw.fallback.mustRevalidate.Load() {
 		cw.swallow = true
-		stripHopHeaders(cw.rw.Header())
 		_ = cw.fc.serveEntry(cw.rw, serveReq, cw.fallback, cw.next,
 			"hit", "fwd=stale", "fwd-status="+strconv.Itoa(status))
 
 		return
 	}
 
-	fresh, swr, varyH, mr, ok := responseCacheable(cw.ix, cw.req, status, cw.rw.Header())
+	// The upstream response is going to the client: move the buffered
+	// headers into the real writer. Connection-nominated fields and
+	// trailer-value keys are hop-by-hop — never forwarded nor stored.
+	connToks := connHeaderTokens(cw.hdr)
+	for k, vv := range cw.hdr {
+		ck := http.CanonicalHeaderKey(k)
+		if ck == "Connection" || connToks[ck] || strings.HasPrefix(k, http.TrailerPrefix) {
+			continue
+		}
+
+		cw.rw.Header()[k] = vv
+	}
+
+	fresh, swr, varyH, mr, ok := responseCacheable(cw.ix, cw.req, status, cw.hdr)
 	if !ok || fresh <= 0 {
 		cw.missStatus()
 		return
@@ -119,7 +143,7 @@ func (cw *captureWriter) decide(status int) {
 	cw.varyH = varyH
 	cw.fresh = fresh
 
-	if cl := cw.rw.Header().Get("Content-Length"); cl != "" {
+	if cl := cw.hdr.Get("Content-Length"); cl != "" {
 		if n, err := strconv.ParseInt(cl, 10, 64); err == nil && n >= 0 {
 			cw.declared = n
 		}
@@ -175,7 +199,7 @@ func (cw *captureWriter) decide(status int) {
 	// Account for the age the response already accumulated in an upstream
 	// cache (RFC 9111 §4.2.3): shifting the clock base back makes StoredAt,
 	// ExpiresAt and the served Age header all include it.
-	if a, err := strconv.Atoi(strings.TrimSpace(cw.rw.Header().Get("Age"))); err == nil && a > 0 {
+	if a, err := strconv.Atoi(strings.TrimSpace(cw.hdr.Get("Age"))); err == nil && a > 0 {
 		now = now.Add(-time.Duration(a) * time.Second)
 	}
 
@@ -184,7 +208,7 @@ func (cw *captureWriter) decide(status int) {
 		VaryHeaders:    varyH,
 		VaryKey:        varyKey(cw.req, varyH),
 		Status:         status,
-		Headers:        map[string][]string(cacheableHeaders(cw.rw.Header())),
+		Headers:        map[string][]string(cacheableHeaders(cw.hdr)),
 		StoredAt:       now.UnixNano(),
 		ExpiresAt:      now.Add(fresh).UnixNano(),
 		StaleAt:        now.Add(fresh + max(swr, cw.ix.sie)).UnixNano(),
@@ -205,14 +229,6 @@ func (cw *captureWriter) missStatus() {
 	cw.rw.Header().Set("Cache-Status", cs)
 }
 
-// stripHopHeaders removes connection-scoped upstream headers before a stale
-// or 304-merged entry replaces the response.
-func stripHopHeaders(h http.Header) {
-	for name := range hopHeaders {
-		h.Del(name)
-	}
-}
-
 func (cw *captureWriter) key() string {
 	vk := varyKey(cw.req, cw.varyH)
 	if vk == "" {
@@ -223,6 +239,17 @@ func (cw *captureWriter) key() string {
 }
 
 func (cw *captureWriter) WriteHeader(status int) {
+	if !cw.decided && status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
+		// Informational response — flush its headers downstream and keep
+		// buffering for the final WriteHeader.
+		for k, vv := range cw.hdr {
+			cw.rw.Header()[k] = vv
+		}
+		cw.rw.WriteHeader(status)
+
+		return
+	}
+
 	if !cw.decided {
 		cw.decide(status)
 	}
@@ -311,7 +338,10 @@ func (cw *captureWriter) Close(handlerErr error) {
 
 	if handlerErr != nil || cw.failed ||
 		(cw.declared >= 0 && cw.declared != cw.bodySize) ||
-		cw.req.Context().Err() != nil {
+		cw.req.Context().Err() != nil ||
+		cw.ix.purgeSeq.Load() != cw.purgeAt {
+		// A purge or unsafe-method invalidation raced this capture —
+		// committing now would resurrect just-purged content.
 		if cw.tmpPath != "" {
 			_ = os.Remove(cw.tmpPath)
 		}
@@ -414,3 +444,7 @@ func (cw *captureWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 	return h.Hijack()
 }
+
+// Unwrap lets http.ResponseController reach the real writer (full-duplex
+// and deadline controls probe through it).
+func (cw *captureWriter) Unwrap() http.ResponseWriter { return cw.rw }

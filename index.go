@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -24,8 +25,11 @@ import (
 	"github.com/caddyserver/caddy/v2"
 )
 
-// fileMagic identifies cache entry files written by this plugin.
-var fileMagic = []byte{'F', 'C', 'H', '1'}
+// fileMagic identifies cache entry files written by this plugin. FCH2
+// changed the varyKey encoding (length-prefixed, all header values); older
+// metas carry keys a lookup would never recompute, so they are rejected and
+// reaped at rebuild.
+var fileMagic = []byte{'F', 'C', 'H', '2'}
 
 // metaHeader is the serialized sidecar for one entry (written to
 // <bodyfile>.meta). Keeping meta and body in separate files lets the body be
@@ -152,6 +156,7 @@ type index struct {
 	varyList     []string
 	noTouch      bool
 	honorReqCC   bool
+	storeCookie  bool
 	ramOnly      bool // disk_size 0: bodies live in RAM only, nothing is persisted
 	keyTmpl      string
 	matchHeaders map[string][]string // canonical name -> allowed values
@@ -161,6 +166,7 @@ type index struct {
 	diskSize  atomic.Int64
 	fileCount atomic.Int64
 	fileSeq   atomic.Uint64 // unique suffix for body files; seeded from the wall clock
+	purgeSeq  atomic.Uint64 // bumped by every purge; in-flight captures compare
 
 	expQueue  expiryHeap
 	heapMu    sync.Mutex
@@ -184,6 +190,7 @@ func newIndex(cfg *FastCache) *index {
 		varyList:     cfg.Vary,
 		noTouch:      cfg.DisableTouchOnHit,
 		honorReqCC:   cfg.HonorRequestCC,
+		storeCookie:  cfg.StoreSetCookie,
 		ramOnly:      cfg.diskBytes <= 0,
 		keyTmpl:      cfg.CacheKey,
 		matchHeaders: func() map[string][]string {
@@ -208,9 +215,15 @@ func newIndex(cfg *FastCache) *index {
 	// from disk, and committing over it would then delete the new file.
 	ix.fileSeq.Store(uint64(time.Now().UnixNano()))
 
-	go ix.evictLoop()
-
 	return ix
+}
+
+// start launches the background workers (expiry sweeper + eviction worker).
+// Called only after a successful rebuild, so a failed provision leaves no
+// goroutines behind; stop() halts both.
+func (ix *index) start() {
+	go ix.evictLoop()
+	go ix.sweep()
 }
 
 // lookup returns the live variant for a request, and whether it is stale.
@@ -589,6 +602,19 @@ func (ix *index) openBody(e *entry) (*os.File, func(), error) {
 
 			if e.body.CompareAndSwap(nil, &data) {
 				ix.memSize.Add(e.size)
+
+				// The entry may have been evicted while we served —
+				// promoting into a dead entry would leak memSize forever
+				// (freeRAM only scans indexed entries). Reclaim it, unless
+				// dropFile's swap already accounted the removal.
+				if v, ok := ix.entries.Load(e.key); !ok || v != e {
+					if e.body.CompareAndSwap(&data, nil) {
+						ix.memSize.Add(-e.size)
+					}
+
+					return
+				}
+
 				ix.maybeEvict()
 			}
 		}
@@ -596,6 +622,15 @@ func (ix *index) openBody(e *entry) (*os.File, func(), error) {
 
 	return f, done, nil
 }
+
+// cacheFileRe matches only the file names fastcache itself creates:
+// <24-hex>-<seq> body, +".tmp" in-flight body, +".meta" sidecar,
+// +".meta.tmp" in-flight sidecar. The orphan pass in rebuild deletes only
+// these — anything else under path is foreign and left alone.
+var cacheFileRe = regexp.MustCompile(`^[0-9a-f]{24}-[0-9]+(\.meta)?(\.tmp)?$`)
+
+// shardDirRe matches the 2-hex shard directories bodies live under.
+var shardDirRe = regexp.MustCompile(`^[0-9a-f]{2}$`)
 
 // filePath returns a unique on-disk path for a key's body file; the meta
 // sidecar appends ".meta". The name is a hash of the key (keys can exceed
@@ -761,16 +796,23 @@ func (ix *index) rebuild() error {
 		ix.mappingMu.Unlock()
 	}
 
-	// Remove everything not referenced by a live meta file, then the now
-	// empty shard directories (Remove fails harmlessly on non-empty ones).
+	// Remove unreferenced fastcache files, then the now empty shard
+	// directories. Foreign files and directories under path are left
+	// alone (Remove also fails harmlessly on non-empty dirs).
 	for _, p := range allFiles {
-		if _, ok := tracked[p]; !ok {
+		if _, ok := tracked[p]; !ok && cacheFileRe.MatchString(filepath.Base(p)) {
 			_ = os.Remove(p)
 		}
 	}
 	for _, d := range dirs {
-		_ = os.Remove(d)
+		if shardDirRe.MatchString(filepath.Base(d)) {
+			_ = os.Remove(d)
+		}
 	}
+
+	// A restored index may already exceed a budget — no store will signal
+	// the eviction worker otherwise.
+	ix.maybeEvict()
 
 	return nil
 }
@@ -839,6 +881,12 @@ func (ix *index) persistMeta(e *entry) {
 // evictions_total metric ("purge" for explicit/admin purges, "invalidate"
 // for unsafe-method invalidation).
 func (ix *index) purge(base, reason string) int {
+	// Bump the generation first: a capture that began before this purge
+	// must not commit the just-purged content afterwards. One counter for
+	// all keys — a purge may also abort an unrelated in-flight store,
+	// which merely costs a re-fetch.
+	ix.purgeSeq.Add(1)
+
 	v, ok := ix.mappings.Load(base)
 	if !ok {
 		return 0
@@ -884,7 +932,10 @@ func (ix *index) baseKey(r *http.Request) string {
 }
 
 // varyKey computes the variant suffix from the request's vary-relevant
-// headers (only those in the entry's stored vary list).
+// headers (only those in the entry's stored vary list). Components are
+// length-prefixed — header values may legally contain '=' and ';', so a
+// plain name=value join could collide two different header sets onto one
+// variant. All values of a repeated header are folded per RFC 9110 §5.3.
 func varyKey(r *http.Request, headers []string) string {
 	if len(headers) == 0 {
 		return ""
@@ -892,10 +943,9 @@ func varyKey(r *http.Request, headers []string) string {
 
 	var b strings.Builder
 	for _, h := range headers {
-		b.WriteString(h)
-		b.WriteByte('=')
-		b.WriteString(r.Header.Get(h))
-		b.WriteByte(';')
+		fmt.Fprintf(&b, "%d:%s", len(h), h)
+		v := strings.Join(r.Header.Values(h), ",")
+		fmt.Fprintf(&b, "%d:%s;", len(v), v)
 	}
 
 	return b.String()

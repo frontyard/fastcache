@@ -57,12 +57,14 @@ func requestBypass(ix *index, r *http.Request) bool {
 // CDN-Cache-Control beats Cache-Control — a present targeted field replaces
 // Cache-Control entirely for this cache.
 func responseCC(h http.Header) map[string]string {
-	cc := h.Get("Fastcache-Cache-Control")
+	// Repeated field lines are equivalent to one comma-joined line (RFC
+	// 9110 §5.3) — fold them before parsing directives.
+	cc := strings.Join(h.Values("Fastcache-Cache-Control"), ",")
 	if cc == "" {
-		cc = h.Get("CDN-Cache-Control")
+		cc = strings.Join(h.Values("CDN-Cache-Control"), ",")
 	}
 	if cc == "" {
-		cc = h.Get("Cache-Control")
+		cc = strings.Join(h.Values("Cache-Control"), ",")
 	}
 	if cc == "" {
 		return nil
@@ -121,15 +123,17 @@ func responseCacheable(ix *index, r *http.Request, status int, h http.Header) (f
 		return 0, 0, nil, false, false
 	}
 
+	// A stored Set-Cookie is replayed to every later client — session
+	// fixation. Never store it unless the operator opted in.
+	if !ix.storeCookie && len(h.Values("Set-Cookie")) > 0 {
+		return 0, 0, nil, false, false
+	}
+
 	if _, mr = cc["must-revalidate"]; !mr {
 		_, mr = cc["proxy-revalidate"]
 	}
 
-	vary := h.Get("Vary")
-	if vary == "*" {
-		return 0, 0, nil, false, false
-	}
-
+	vary := strings.Join(h.Values("Vary"), ",")
 	if vary != "" {
 		allowed := map[string]bool{}
 		for _, v := range ix.varyList {
@@ -140,6 +144,10 @@ func responseCacheable(ix *index, r *http.Request, status int, h http.Header) (f
 			name := http.CanonicalHeaderKey(strings.TrimSpace(v))
 			if name == "" {
 				continue
+			}
+
+			if name == "*" {
+				return 0, 0, nil, false, false
 			}
 
 			if !allowed[name] {
@@ -204,12 +212,35 @@ func freshness(ix *index, h http.Header) time.Duration {
 	return ix.defaultTTL
 }
 
-// cacheableHeaders returns the headers to persist (hop-by-hop stripped).
+// connHeaderTokens returns the field names a response nominates as
+// hop-by-hop via its Connection header (RFC 9110 §7.6.1).
+func connHeaderTokens(h http.Header) map[string]bool {
+	var out map[string]bool
+
+	for _, line := range h.Values("Connection") {
+		for _, tok := range strings.Split(line, ",") {
+			if name := http.CanonicalHeaderKey(strings.TrimSpace(tok)); name != "" {
+				if out == nil {
+					out = map[string]bool{}
+				}
+
+				out[name] = true
+			}
+		}
+	}
+
+	return out
+}
+
+// cacheableHeaders returns the headers to persist: hop-by-hop fields,
+// Connection-nominated fields, and trailer-value keys are all excluded.
 func cacheableHeaders(h http.Header) http.Header {
+	connToks := connHeaderTokens(h)
 	out := make(http.Header, len(h))
 
 	for k, vv := range h {
-		if hopHeaders[http.CanonicalHeaderKey(k)] {
+		ck := http.CanonicalHeaderKey(k)
+		if hopHeaders[ck] || connToks[ck] || strings.HasPrefix(k, http.TrailerPrefix) {
 			continue
 		}
 

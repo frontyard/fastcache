@@ -5,6 +5,7 @@
 package fastcache
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +25,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/dustin/go-humanize"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -46,6 +49,7 @@ type FastCache struct {
 	PurgeAllow           []string            `json:"purge_allow,omitempty"`
 	HonorRequestCC       bool                `json:"honor_request_cache_control,omitempty"`
 	PromoteBelow         string              `json:"promote_below,omitempty"`
+	StoreSetCookie       bool                `json:"store_set_cookie,omitempty"`
 
 	memoryBytes  int64
 	diskBytes    int64
@@ -99,6 +103,24 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("stale_if_error: %w", err)
 	}
 
+	for name, v := range map[string]int64{
+		"memory_size": fc.memoryBytes, "disk_size": fc.diskBytes, "promote_below": fc.promoteBelow,
+	} {
+		if v < 0 {
+			return fmt.Errorf("%s must be >= 0, got %d", name, v)
+		}
+	}
+	for name, v := range map[string]time.Duration{
+		"ttl": fc.ttl, "stale_while_revalidate": fc.swr, "stale_if_error": fc.sie,
+	} {
+		if v < 0 {
+			return fmt.Errorf("%s must be >= 0, got %s", name, v)
+		}
+	}
+	if fc.MaxItems < 0 {
+		return fmt.Errorf("max_items must be >= 0, got %d", fc.MaxItems)
+	}
+
 	if err = fc.compilePurgeAllow(); err != nil {
 		return err
 	}
@@ -113,7 +135,23 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("rebuilding the index: %w", err)
 	}
 
-	go fc.idx.sweep()
+	// Instances sharing a directory index each other's files at rebuild
+	// and purge/evict across one another — almost always a mistake.
+	warned := false
+	liveCaches.Range(func(k, _ any) bool {
+		if other := k.(*FastCache); other != fc && filepath.Clean(other.Path) == filepath.Clean(fc.Path) {
+			warned = true
+			return false
+		}
+
+		return true
+	})
+	if warned {
+		ctx.Logger().Warn("fastcache instances share a cache directory; they will index and evict each other's entries",
+			zap.String("path", fc.Path))
+	}
+
+	fc.idx.start()
 	liveCaches.Store(fc, struct{}{})
 
 	if reg := ctx.GetMetricsRegistry(); reg != nil {
@@ -311,6 +349,7 @@ func (fc *FastCache) revalidateOrStale(w http.ResponseWriter, r *http.Request, e
 	cw.reval = e
 	cw.origReq = r
 	cw.next = next
+	cw.ownVal = canMerge304(r, e)
 	defer func() { cw.Close(err) }()
 
 	if err = next.ServeHTTP(cw, r2); err != nil && !cw.wrote && !cw.swallow && !e.mustRevalidate.Load() {
@@ -319,6 +358,20 @@ func (fc *FastCache) revalidateOrStale(w http.ResponseWriter, r *http.Request, e
 	}
 
 	return err
+}
+
+// canMerge304 reports whether a 304 proves the stored entry fresh: either
+// the revalidation carried our stored validators (the client sent no
+// If-None-Match, so revalRequest attached them), or the client's own
+// If-None-Match already names the stored ETag. A 304 for other client
+// validators only proves the client's copy fresh — it must not merge.
+func canMerge304(r *http.Request, e *entry) bool {
+	inm := r.Header.Get("If-None-Match")
+	if inm == "" {
+		return true
+	}
+
+	return etagMatches(inm, (*e.headers.Load()).Get("ETag"))
 }
 
 // revalRequest clones r for upstream revalidation: client Range headers are
@@ -400,6 +453,7 @@ func (fc *FastCache) refresh(e *entry, r *http.Request, next caddyhttp.Handler) 
 		cw := newCaptureWriter(fc, &discardRW{h: http.Header{}}, req, e.baseKey)
 		cw.reval = e
 		cw.next = next
+		cw.ownVal = canMerge304(r, e)
 
 		err := next.ServeHTTP(cw, req)
 		cw.Close(err)
@@ -447,6 +501,19 @@ func (s *statusRW) Flush() {
 	if f, ok := s.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Unwrap lets http.ResponseController reach the real writer (full-duplex
+// and deadline controls probe through it).
+func (s *statusRW) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+func (s *statusRW) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := s.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+
+	return h.Hijack()
 }
 
 // serveEntry writes a cached variant to the client. cs holds RFC 9211
@@ -615,15 +682,15 @@ func (fc *FastCache) handlePurge(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	w.Header().Set("Cache-Status", "fastcache; purged")
-	fc.idx.metrics.req("purged")
-
 	if fc.idx.purge(fc.idx.baseKey(r), "purge") == 0 {
+		w.Header().Set("Cache-Status", "fastcache; fwd=purge-miss")
 		w.WriteHeader(http.StatusNotFound)
 
 		return nil
 	}
 
+	w.Header().Set("Cache-Status", "fastcache; purged")
+	fc.idx.metrics.req("purged")
 	w.WriteHeader(http.StatusOK)
 
 	return nil
@@ -715,6 +782,8 @@ func (fc *FastCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				fc.PurgeAllow = append(fc.PurgeAllow, d.RemainingArgs()...)
 			case "honor_request_cache_control":
 				fc.HonorRequestCC = true
+			case "store_set_cookie":
+				fc.StoreSetCookie = true
 			case "promote_below":
 				if !d.NextArg() {
 					return d.ArgErr()

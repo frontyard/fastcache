@@ -57,7 +57,7 @@ func newTestCache(t *testing.T, mutate func(*FastCache)) *FastCache {
 		t.Fatalf("rebuild: %v", err)
 	}
 
-	go fc.idx.sweep()
+	fc.idx.start()
 
 	t.Cleanup(fc.idx.stop)
 
@@ -157,6 +157,10 @@ func TestUncacheableResponses(t *testing.T) {
 		{"max-age=0", http.Header{"Cache-Control": {"public, max-age=0"}}, 200},
 		{"vary-star", http.Header{"Vary": {"*"}}, 200},
 		{"status-500", nil, 500},
+		{"set-cookie", http.Header{
+			"Cache-Control": {"public, max-age=3600"},
+			"Set-Cookie":    {"sid=abc; HttpOnly"},
+		}, 200},
 	}
 
 	for _, tc := range cases {
@@ -186,6 +190,27 @@ func TestUncacheableResponses(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStoreSetCookie(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.StoreSetCookie = true })
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, []byte("x"), http.Header{
+		"Cache-Control": {"public, max-age=3600"},
+		"Set-Cookie":    {"sid=abc; HttpOnly"},
+	})
+
+	w1 := get(t, fc, "/", nil, next)
+	w2 := get(t, fc, "/", nil, next)
+
+	if calls.Load() != 1 {
+		t.Fatalf("store_set_cookie should store the response, got %d calls", calls.Load())
+	}
+	if got := w2.Header().Get("Set-Cookie"); got != "sid=abc; HttpOnly" {
+		t.Fatalf("hit should replay the stored Set-Cookie, got %q", got)
+	}
+	_ = w1
 }
 
 func TestRequestBypass(t *testing.T) {
@@ -298,6 +323,160 @@ func TestPurge(t *testing.T) {
 	}
 }
 
+func TestPurgeMissStatus(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	r := httptest.NewRequest("PURGE", "http://example.com/never-stored", nil)
+	r.RemoteAddr = "127.0.0.1:1234"
+	w := httptest.NewRecorder()
+
+	if err := fc.ServeHTTP(w, r, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for a missing key, got %d", w.Code)
+	}
+	if cs := w.Header().Get("Cache-Status"); cs == "fastcache; purged" {
+		t.Fatalf("a 404 PURGE must not claim 'purged', got %q", cs)
+	}
+}
+
+// TestPurgeAbortsInflightCommit: a PURGE issued while an upstream response
+// is still being captured must prevent that capture's commit — otherwise
+// the just-purged content is resurrected.
+func TestPurgeAbortsInflightCommit(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("part1"))
+		close(started)
+		<-release
+		_, _ = w.Write([]byte("part2"))
+
+		return nil
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		_ = fc.ServeHTTP(httptest.NewRecorder(), r, next)
+	}()
+
+	<-started
+
+	// PURGE (of a not-yet-committed key) lands mid-capture.
+	pr := httptest.NewRequest("PURGE", "http://example.com/", nil)
+	pr.RemoteAddr = "127.0.0.1:1234"
+	_ = fc.ServeHTTP(httptest.NewRecorder(), pr, next)
+
+	close(release)
+	<-done
+
+	// The in-flight commit must have been dropped: next GET re-fetches.
+	get(t, fc, "/", nil, countingUpstream(&calls, []byte("v2"), http.Header{"Cache-Control": {"public, max-age=3600"}}))
+
+	if calls.Load() != 2 {
+		t.Fatalf("purged content was committed by the racing capture, calls=%d", calls.Load())
+	}
+}
+
+// TestMultiValuedHeaders: repeated Cache-Control and Vary field lines fold
+// per RFC 9110 §5.3 and must be parsed as one comma-joined value.
+func TestMultiValuedHeaders(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.Vary = []string{"X-A", "X-B"} })
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		w.Header()["Cache-Control"] = []string{"public", "max-age=3600"}
+		w.Header()["Vary"] = []string{"X-A", "X-B"}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("x"))
+
+		return nil
+	})
+
+	mkReq := func(a, b string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		r.Header.Set("X-A", a)
+		r.Header.Set("X-B", b)
+
+		return r
+	}
+
+	_ = fc.ServeHTTP(httptest.NewRecorder(), mkReq("1", "2"), next)
+	_ = fc.ServeHTTP(httptest.NewRecorder(), mkReq("1", "2"), next)
+
+	if calls.Load() != 1 {
+		t.Fatalf("multi-line Cache-Control/Vary should still store and hit, got %d calls", calls.Load())
+	}
+}
+
+// TestClientValidatorsDontMerge: when the client supplied its own
+// If-None-Match differing from the stored ETag, a 304 proves the client's
+// copy fresh — not ours. The 304 forwards to the client; the entry is not
+// refreshed.
+func TestClientValidatorsDontMerge(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleWhileRevalidate = "0"
+		fc.StaleIfError = "10s"
+	})
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		if inm := r.Header.Get("If-None-Match"); inm != "" {
+			w.WriteHeader(http.StatusNotModified)
+
+			return nil
+		}
+		w.Header().Set("ETag", `"v1"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("body"))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(80 * time.Millisecond)
+
+	// Stale entry; client presents a *different* validator.
+	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	r.Header.Set("If-None-Match", `"other"`)
+	w := httptest.NewRecorder()
+	if err := fc.ServeHTTP(w, r, next); err != nil {
+		t.Fatal(err)
+	}
+
+	if w.Code != http.StatusNotModified {
+		t.Fatalf("client's 304 should pass through, got %d", w.Code)
+	}
+
+	// The entry must still be stale — not merged — so another request
+	// revalidates upstream again instead of hitting.
+	var recheck atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		get(t, fc, "/", nil, countingUpstream(&recheck, []byte("x"), nil))
+	}()
+	<-done
+
+	if recheck.Load() != 1 {
+		t.Fatal("a client-validator 304 must not refresh the stored entry")
+	}
+}
+
 func TestVary(t *testing.T) {
 	fc := newTestCache(t, func(fc *FastCache) { fc.Vary = []string{"Accept-Language"} })
 
@@ -347,6 +526,80 @@ func TestVaryUnlistedHeader(t *testing.T) {
 
 	if calls.Load() != 2 {
 		t.Errorf("response varying on unlisted header must not be cached, got %d calls", calls.Load())
+	}
+}
+
+// TestVaryKeyCollision: vary components are length-prefixed, so header
+// values containing ';'/'=' cannot make two different header sets share a
+// variant key.
+func TestVaryKeyCollision(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.Vary = []string{"X-A", "X-B"} })
+
+	var calls atomic.Int64
+
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Vary", "X-A, X-B")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(r.Header.Get("X-A") + "|" + r.Header.Get("X-B")))
+
+		return nil
+	})
+
+	mkReq := func(a, b string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		r.Header.Set("X-A", a)
+		r.Header.Set("X-B", b)
+
+		return r
+	}
+
+	w1 := httptest.NewRecorder()
+	_ = fc.ServeHTTP(w1, mkReq("1", "z;X-B=q"), next)
+	w2 := httptest.NewRecorder()
+	_ = fc.ServeHTTP(w2, mkReq("1;X-B=z", "q"), next)
+	w3 := httptest.NewRecorder()
+	_ = fc.ServeHTTP(w3, mkReq("1", "z;X-B=q"), next)
+
+	if calls.Load() != 2 {
+		t.Fatalf("colliding vary keys merged two variants: %d upstream calls", calls.Load())
+	}
+	if got := w3.Body.String(); got != "1|z;X-B=q" {
+		t.Fatalf("hit served the wrong variant: %q", got)
+	}
+}
+
+// TestVaryMultiValue: repeated header lines and one comma-folded line are
+// equivalent field values and must key the same variant.
+func TestVaryMultiValue(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.Vary = []string{"X-Lang"} })
+
+	var calls atomic.Int64
+
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Vary", "X-Lang")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("x"))
+
+		return nil
+	})
+
+	r1 := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	r1.Header.Add("X-Lang", "en")
+	r1.Header.Add("X-Lang", "fr")
+
+	_ = fc.ServeHTTP(httptest.NewRecorder(), r1, next)
+
+	r2 := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	r2.Header.Set("X-Lang", "en,fr")
+
+	_ = fc.ServeHTTP(httptest.NewRecorder(), r2, next)
+
+	if calls.Load() != 1 {
+		t.Fatalf("equivalent multi-valued header should hit one variant, got %d calls", calls.Load())
 	}
 }
 
@@ -540,7 +793,7 @@ func TestRestartRebuild(t *testing.T) {
 		t.Fatalf("rebuild: %v", err)
 	}
 
-	go fc2.idx.sweep()
+	fc2.idx.start()
 
 	defer fc2.idx.stop()
 
@@ -554,13 +807,80 @@ func TestRestartRebuild(t *testing.T) {
 	}
 }
 
+// TestRebuildRejectsOldMagic: metas written under a previous format version
+// (FCH1) carry stale varyKey encodings — they must be rejected and their
+// files reaped rather than loaded as unreachable entries.
+func TestRebuildRejectsOldMagic(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, []byte("persistent"), http.Header{"Cache-Control": {"public, max-age=3600"}})
+
+	get(t, fc, "/", nil, next)
+	fc.idx.stop()
+
+	// Downgrade the meta file to the previous format version.
+	var metaPath string
+	for _, mp := range findMeta(t, fc.Path) {
+		metaPath = mp
+	}
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(data[:4], "FCH1")
+	if err := os.WriteFile(metaPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fc2 := &FastCache{Path: fc.Path, MemorySize: "64MB", DiskSize: "1GB", TTL: "1h"}
+	fc2.memoryBytes, _ = parseSize(fc2.MemorySize, 0)
+	fc2.diskBytes, _ = parseSize(fc2.DiskSize, 0)
+	fc2.ttl, _ = parseDuration(fc2.TTL, 0)
+	fc2.idx = newIndex(fc2)
+
+	if err := fc2.idx.rebuild(); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+
+	fc2.idx.start()
+
+	defer fc2.idx.stop()
+
+	if fc2.idx.fileCount.Load() != 0 {
+		t.Fatalf("FCH1 meta should not be indexed, got %d entries", fc2.idx.fileCount.Load())
+	}
+	if _, err := os.Stat(metaPath); !os.IsNotExist(err) {
+		t.Error("FCH1 meta should have been reaped at rebuild")
+	}
+}
+
+// findMeta returns the .meta sidecar paths under dir.
+func findMeta(t *testing.T, dir string) []string {
+	t.Helper()
+
+	var out []string
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".meta") {
+			out = append(out, p)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return out
+}
+
 func TestDiskBudgetEviction(t *testing.T) {
 	fc := newTestCache(t, func(fc *FastCache) { fc.DiskSize = "2KB" })
 
 	var calls atomic.Int64
 
 	for i, key := range []string{"/a", "/b", "/c"} {
-		body := []byte(fmt.Sprintf("body-%d-%s", i, string(make([]byte, 700))))
+		body := fmt.Appendf(nil, "body-%d-%s", i, string(make([]byte, 700)))
 		next := countingUpstream(&calls, body, http.Header{"Cache-Control": {"public, max-age=3600"}})
 		get(t, fc, key, nil, next)
 	}
@@ -686,7 +1006,10 @@ func TestStaleWhileRevalidate(t *testing.T) {
 func TestOrphanTmpFiles(t *testing.T) {
 	fc := newTestCache(t, nil)
 
-	orphan := filepath.Join(fc.Path, "crashed.tmp")
+	orphan := filepath.Join(fc.Path, "ab", "0123456789abcdef01234567-1.tmp")
+	if err := os.MkdirAll(filepath.Dir(orphan), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(orphan, []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -705,6 +1028,77 @@ func TestOrphanTmpFiles(t *testing.T) {
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
 		t.Error("expected orphan tmp file removed on rebuild")
 	}
+}
+
+// TestRebuildPreservesForeignFiles: files that don't look like fastcache
+// data (non-matching names, foreign directories) must survive a rebuild —
+// path may be misconfigured to a shared directory.
+func TestRebuildPreservesForeignFiles(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	foreign := filepath.Join(fc.Path, "notes.txt")
+	foreignDir := filepath.Join(fc.Path, "otherapp", "data.bin")
+
+	if err := os.MkdirAll(filepath.Dir(foreignDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{foreign, foreignDir} {
+		if err := os.WriteFile(p, []byte("keep me"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fc.idx.stop()
+
+	fc2 := &FastCache{Path: fc.Path, MemorySize: "64MB", DiskSize: "1GB", TTL: "1h"}
+	fc2.memoryBytes, _ = parseSize(fc2.MemorySize, 0)
+	fc2.diskBytes, _ = parseSize(fc2.DiskSize, 0)
+	fc2.idx = newIndex(fc2)
+
+	if err := fc2.idx.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+
+	defer fc2.idx.stop()
+
+	for _, p := range []string{foreign, foreignDir} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("foreign file removed on rebuild: %s", p)
+		}
+	}
+	if _, err := os.Stat(filepath.Dir(foreignDir)); err != nil {
+		t.Error("foreign directory removed on rebuild")
+	}
+}
+
+// TestRebuildOverBudgetEvicts: a restored index that already exceeds
+// disk_size must start evicting without waiting for a new store.
+func TestRebuildOverBudgetEvicts(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, make([]byte, 700), http.Header{"Cache-Control": {"public, max-age=3600"}})
+
+	for _, key := range []string{"/a", "/b", "/c"} {
+		get(t, fc, key, nil, next)
+	}
+	fc.idx.stop()
+
+	fc2 := &FastCache{Path: fc.Path, MemorySize: "0", DiskSize: "1KB", TTL: "1h"}
+	fc2.diskBytes, _ = parseSize(fc2.DiskSize, 0)
+	fc2.ttl, _ = parseDuration(fc2.TTL, 0)
+	fc2.idx = newIndex(fc2)
+
+	if err := fc2.idx.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	fc2.idx.start()
+
+	defer fc2.idx.stop()
+
+	waitFor(t, "over-budget rebuild to evict", func() bool {
+		return fc2.idx.diskSize.Load() <= 1024
+	})
 }
 
 // TestConcurrentPurgeChurn hammers hits on a few keys while PURGEs and
@@ -787,6 +1181,45 @@ func TestDiskHitPromotesToRAM(t *testing.T) {
 
 	if got := fc.idx.memSize.Load(); got != 4096 {
 		t.Errorf("memSize = %d, want 4096", got)
+	}
+}
+
+// TestPromoteAfterEvictionNoLeak: a hit that promotes a body must not
+// resurrect RAM accounting on an entry evicted mid-serve — memSize would
+// leak forever since freeRAM only scans indexed entries.
+func TestPromoteAfterEvictionNoLeak(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, make([]byte, 4096), http.Header{"Cache-Control": {"public, max-age=3600"}})
+
+	get(t, fc, "/", nil, next)
+
+	e, _, ok := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	if !ok {
+		t.Fatal("expected entry")
+	}
+
+	// Demote to disk so the next hit takes the promotion path.
+	if b := e.body.Swap(nil); b != nil {
+		fc.idx.memSize.Add(-int64(len(*b)))
+	}
+
+	_, done, err := fc.idx.openBody(e)
+	if err != nil {
+		t.Fatalf("openBody: %v", err)
+	}
+
+	// Evict while the serve holds the body file open, then let the
+	// promotion run — it must roll its accounting back.
+	fc.idx.deleteEntry(e)
+	done()
+
+	if e.body.Load() != nil {
+		t.Error("body promoted into an evicted entry")
+	}
+	if got := fc.idx.memSize.Load(); got != 0 {
+		t.Errorf("memSize leaked: got %d, want 0", got)
 	}
 }
 
@@ -1124,6 +1557,147 @@ func TestStaleIfError(t *testing.T) {
 	}
 }
 
+// TestStaleFallbackHeaderIsolation: headers the failing upstream wrote must
+// not leak into the served stale entry — captureWriter buffers upstream
+// headers privately and only commits them to the client on a real forward.
+func TestStaleFallbackHeaderIsolation(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleIfError = "5s"
+	})
+
+	var calls atomic.Int64
+	fail := 0 // 0 = ok, 1 = 5xx, 2 = handler error
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+
+		if fail != 0 {
+			w.Header().Set("X-Leak", "1")
+			w.Header().Set("Set-Cookie", "sid=bad")
+			if fail == 2 {
+				return errors.New("upstream dead")
+			}
+			w.WriteHeader(http.StatusBadGateway)
+
+			return nil
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("v1"))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next) // stores v1 (no CC → ttl=50ms)
+	time.Sleep(80 * time.Millisecond)
+
+	for _, fail = range []int{1, 2} {
+		w := get(t, fc, "/", nil, next)
+		if w.Code != http.StatusOK || w.Body.String() != "v1" {
+			t.Fatalf("fail=%d: expected stale fallback, got %d %q", fail, w.Code, w.Body.String())
+		}
+		if w.Header().Get("X-Leak") != "" || w.Header().Get("Set-Cookie") != "" {
+			t.Errorf("fail=%d: upstream error headers leaked into the stale serve", fail)
+		}
+	}
+}
+
+// TestHopByHopNotStored: fields nominated by the response's Connection
+// header and trailer-value keys are hop-by-hop — neither stored nor
+// forwarded on a miss.
+func TestHopByHopNotStored(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Connection", "X-Internal")
+		w.Header().Set("X-Internal", "secret")
+		w.Header().Add(http.TrailerPrefix+"X-Trailer-Val", "tl")
+		w.Header().Set("X-Normal", "kept")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("x"))
+
+		return nil
+	})
+
+	w1 := get(t, fc, "/", nil, next)
+	w2 := get(t, fc, "/", nil, next)
+
+	if calls.Load() != 1 {
+		t.Fatalf("expected stored response, got %d calls", calls.Load())
+	}
+
+	for _, w := range []*httptest.ResponseRecorder{w1, w2} {
+		if w.Header().Get("X-Internal") != "" {
+			t.Error("Connection-nominated header reached the client")
+		}
+		if w.Header().Get(http.TrailerPrefix+"X-Trailer-Val") != "" || w.Header().Get("X-Trailer-Val") != "" {
+			t.Error("trailer value key reached the client")
+		}
+		if w.Header().Get("X-Normal") != "kept" {
+			t.Error("normal upstream header was dropped")
+		}
+	}
+}
+
+// rw1xx wraps a recorder with real-server 1xx semantics: informational
+// WriteHeader codes are recorded but don't end the response (httptest's
+// ResponseRecorder treats the first WriteHeader as final).
+type rw1xx struct {
+	http.ResponseWriter
+	codes []int
+}
+
+func (w *rw1xx) WriteHeader(code int) {
+	w.codes = append(w.codes, code)
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		return
+	}
+
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// TestInformationalPassthrough: a 1xx (e.g. 103 Early Hints) must forward
+// to the client without triggering the cacheability decision — the final
+// WriteHeader is what decides.
+func TestInformationalPassthrough(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Link", "</style.css>; rel=preload")
+		w.WriteHeader(http.StatusEarlyHints)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("x"))
+
+		return nil
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	rec := httptest.NewRecorder()
+	w := &rw1xx{ResponseWriter: rec}
+
+	if err := fc.ServeHTTP(w, r, next); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(w.codes) != 2 || w.codes[0] != http.StatusEarlyHints || w.codes[1] != http.StatusOK {
+		t.Fatalf("expected codes [103 200], got %v", w.codes)
+	}
+
+	w2 := get(t, fc, "/", nil, next)
+	if calls.Load() != 1 {
+		t.Fatalf("response after 103 was not cached: %d calls", calls.Load())
+	}
+	if w2.Header().Get("Cache-Control") == "" || w2.Header().Get("Link") == "" {
+		t.Error("headers set around the 1xx were dropped")
+	}
+}
+
 // TestMatchHeader: when match_header rules are set, only responses whose
 // headers match are stored.
 func TestMatchHeader(t *testing.T) {
@@ -1243,6 +1817,14 @@ func TestAdminAPI(t *testing.T) {
 
 	if w := get(t, fc, "/b", nil, next); !strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
 		t.Fatal("/b should still be cached")
+	}
+
+	// An empty pattern would match every key — rejected as a guard.
+	ew := httptest.NewRecorder()
+	err := purgeCacheKeys(ew, httptest.NewRequest(http.MethodDelete, "/fastcache/purge", strings.NewReader(`{"pattern": ""}`)))
+	var apiErr caddy.APIError
+	if !errors.As(err, &apiErr) || apiErr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty pattern, got %v", err)
 	}
 }
 func TestRAMOnly(t *testing.T) {
@@ -1675,6 +2257,13 @@ func TestProvisionBadConfig(t *testing.T) {
 		{"bad sie", func(fc *FastCache) { fc.StaleIfError = "eventually" }},
 		{"bad purge_allow", func(fc *FastCache) { fc.PurgeAllow = []string{"not-an-ip"} }},
 		{"bad promote_below", func(fc *FastCache) { fc.PromoteBelow = "lots" }},
+		{"negative memory_size", func(fc *FastCache) { fc.MemorySize = "-1" }},
+		{"negative disk_size", func(fc *FastCache) { fc.DiskSize = "-1" }},
+		{"negative ttl", func(fc *FastCache) { fc.TTL = "-1h" }},
+		{"negative swr", func(fc *FastCache) { fc.StaleWhileRevalidate = "-5s" }},
+		{"negative sie", func(fc *FastCache) { fc.StaleIfError = "-5s" }},
+		{"negative max_items", func(fc *FastCache) { fc.MaxItems = -5 }},
+		{"negative promote_below", func(fc *FastCache) { fc.PromoteBelow = "-1" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fc := &FastCache{Path: t.TempDir(), TTL: "1h"}
@@ -1765,6 +2354,18 @@ func TestCaptureWriterInterfaces(t *testing.T) {
 	w := get(t, fc, "/", nil, next)
 	if w.Code != http.StatusOK || !w.Flushed {
 		t.Fatalf("expected 200 + flushed recorder, got %d flushed=%v", w.Code, w.Flushed)
+	}
+
+	// Unwrap exposes the wrapped writer to http.ResponseController probes.
+	rec := httptest.NewRecorder()
+	cw := newCaptureWriter(fc, rec, httptest.NewRequest(http.MethodGet, "/", nil), "k")
+	if cw.Unwrap() != http.ResponseWriter(rec) {
+		t.Error("captureWriter.Unwrap does not return the wrapped writer")
+	}
+
+	sw := &statusRW{ResponseWriter: rec}
+	if sw.Unwrap() != http.ResponseWriter(rec) {
+		t.Error("statusRW.Unwrap does not return the wrapped writer")
 	}
 }
 

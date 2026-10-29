@@ -84,6 +84,10 @@ func purgeCacheKeys(w http.ResponseWriter, r *http.Request) error {
 		return caddy.APIError{HTTPStatus: http.StatusBadRequest, Err: err}
 	}
 
+	if payload.Pattern == "" {
+		return caddy.APIError{HTTPStatus: http.StatusBadRequest, Err: fmt.Errorf("pattern must not be empty")}
+	}
+
 	re, err := regexp.Compile(payload.Pattern)
 	if err != nil {
 		return caddy.APIError{HTTPStatus: http.StatusBadRequest, Err: fmt.Errorf("invalid pattern: %w", err)}

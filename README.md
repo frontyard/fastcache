@@ -73,6 +73,13 @@ into the cache while streaming it to the client.
 | `purge_allow`                 | loopback only          | IPs/CIDRs allowed to send `PURGE`                                                         |
 | `honor_request_cache_control` | off                    | Honor client `no-cache`/`no-store`/`Pragma` as a bypass (default ignores them, nginx-style) |
 | `promote_below`               | `16KB`                 | Only bodies up to this size promote to the RAM tier; larger ones always serve via sendfile. `0` = never promote |
+| `store_set_cookie`            | off                    | Store responses carrying `Set-Cookie`. Off by default: a stored cookie is replayed to every later client (session fixation). Only enable for upstreams whose Set-Cookie is safe to share |
+
+`path` must be a dedicated directory per `fastcache` block — the cache owns
+its contents (rebuild removes orphaned fastcache files; foreign files are
+left alone but don't share the directory anyway). Two blocks pointing at the
+same `path` index and evict each other's entries; the second one logs a
+warning at provision.
 
 ### Examples
 
@@ -130,7 +137,10 @@ https://example.com {
 `PURGE <uri>` evicts all variants of a key. Without `purge_allow` only loopback
 clients may purge; other peers get `403`. The check runs against `RemoteAddr` —
 when Caddy sits behind a reverse proxy, allowlist the proxy's CIDR. Responds
-`200` with `Cache-Status: fastcache; purged`, `404` if nothing was stored.
+`200` with `Cache-Status: fastcache; purged`, or `404` with `Cache-Status:
+fastcache; fwd=purge-miss` when nothing was stored. A PURGE also aborts any
+still-in-flight upstream capture for that key, so purged content cannot be
+re-committed by a racing store.
 
 A richer purge surface is exposed on caddy's **admin endpoint** (module
 `admin.api.fastcache`, inheriting the admin listener's access control —
@@ -150,7 +160,9 @@ retention window: an entry lives until `expiry + max(swr, sie)`.
 - Past it (SIE-only window), hits synchronously revalidate — but if upstream
   fails (handler error, or ≥500 status), the stale entry is served instead.
   Concurrent SIE hits coalesce: one revalidation, followers get the stale
-  entry.
+  entry — nginx `proxy_cache_use_stale updating` semantics, i.e. followers
+  get the stale response *before* the revalidation's outcome is known rather
+  than only on actual failure.
 - Revalidation is **conditional**: stored `ETag`/`Last-Modified` validators
   are sent as `If-None-Match`/`If-Modified-Since`, and a `304` merges the new
   headers and freshness into the entry in place (RFC 9111 §4.3.4) — no body
@@ -169,7 +181,12 @@ retention window: an entry lives until `expiry + max(swr, sie)`.
   rules and carry a heuristically cacheable status (RFC 9111 §3): `200, 203,
   204, 300, 301, 308, 404, 405, 410, 414, 501`. `206` is deliberately excluded —
   a partial body must never become a stored variant. Upstream `no-store`,
-  `private`, `Set-Cookie`, etc. are respected.
+  `private`, `Vary: *`, and `Set-Cookie` are respected (the last unless
+  `store_set_cookie` is set). Responses with non-positive freshness
+  (`max-age=0`, a past `Expires`) are never stored — so they get no
+  stale_if_error fallback either. OPTIONS/TRACE bypass the cache without
+  invalidating; only GET responses populate entries (HEAD hits are served
+  from them).
 - **Targeted Cache-Control** (RFC 9213): `Fastcache-Cache-Control` overrides
   `CDN-Cache-Control`, which overrides `Cache-Control` — an origin can give
   this cache its own TTL/policy without affecting browsers.
@@ -220,7 +237,7 @@ one config share the collectors; gauges sum across live instances.
 |----------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | `fastcache.go` | Module registration, config/Caddyfile parsing, `ServeHTTP` (bypass → hit → SWR → singleflight miss), PURGE                                    |
 | `index.go`     | The cache index: key mappings, variant sets, RAM/disk accounting, near-LRU eviction, expiry heap + sweeper, sidecar IO, startup rebuild       |
-| `capture.go`   | `captureWriter` — tees the upstream response to a `.tmp` file, commits by atomic rename (body first, meta last)                               |
+| `capture.go`   | `captureWriter` — buffers upstream headers privately (a swallowed/failed response never leaks headers), tees the body to a `.tmp` file, commits by atomic rename (body first, meta last) |
 | `cacheable.go` | Request bypass, response cacheability, freshness math, `Vary` handling                                                                        |
 | `admin.go`     | `admin.api.fastcache` — `GET /fastcache/keys`, `DELETE /fastcache/purge` (regex)                                                              |
 | `metrics.go`   | Prometheus collectors registered into the config's shared registry                                                                            |
@@ -236,7 +253,8 @@ otherwise be unreachable forever.
 
 ### On-disk format
 
-Each entry is a **body file plus a `.meta` sidecar** (magic `FCH1`, length,
+Each entry is a **body file plus a `.meta` sidecar** (magic `FCH2` — format
+version; older-version metas are rejected and reaped at rebuild — length,
 gob-encoded headers/status/timestamps) under `path/<xx>/` — a 256-way shard
 derived from the key hash, so no single directory accumulates millions of
 entries. The meta file is written last, so its presence marks a complete
@@ -285,9 +303,10 @@ The hit path takes no locks:
 ### Correctness under failure
 
 `captureWriter` commits only complete responses: it discards on short/failed
-downstream `Write`, handler errors, request-context cancellation, and body size
-mismatching the upstream `Content-Length` — a truncated stream can never poison
-the cache.
+downstream `Write`, handler errors, request-context cancellation, body size
+mismatching the upstream `Content-Length`, and on any PURGE/invalidation that
+landed while the capture was still in flight — a truncated or superseded
+stream can never poison the cache.
 
 ## Benchmark results
 
