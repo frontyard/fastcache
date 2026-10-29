@@ -1,5 +1,8 @@
 # fastcache
 
+[![CI](https://github.com/frontyard/fastcache/actions/workflows/ci.yml/badge.svg)](https://github.com/frontyard/fastcache/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/frontyard/fastcache/branch/main/graph/badge.svg)](https://codecov.io/gh/frontyard/fastcache)
+
 A standalone Caddy HTTP handler (`http.handlers.fastcache`, Caddyfile directive
 `fastcache`) that caches GET/HEAD responses in a two-tier store:
 
@@ -436,7 +439,7 @@ shared-zone bookkeeping nginx pays per request.
 
 ```sh
 go build ./...            # module name is `fastcache`; rename to a domain path before publishing
-go test -race -count=1    # 52 tests, ~85% statement coverage, including concurrency-churn under -race
+go test -race -count=1    # 86 tests, ~87% statement coverage, including concurrency-churn under -race
 bash bench/run.sh         # end-to-end bench (see bench/README below)
 ```
 
