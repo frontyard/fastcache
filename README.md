@@ -27,7 +27,7 @@ the cache survives restarts.
 
 ## Why
 
-`caddy + souin + simplefs` benchmarks around 40–50k req/s where nginx
+`caddy + souin` benchmarks around 40–50k req/s where nginx
 `proxy_cache` does ~200–240k. Storage contributes <1% of request latency — the
 gap is per-hit middleware machinery, and the souin `Storer` interface returns
 `[]byte`, which makes sendfile impossible. This module owns the whole request
@@ -109,7 +109,7 @@ into the cache while streaming it to the client.
 | `ttl`                         | `1h`                   | Fallback freshness when the response carries no `max-age`/`s-maxage`/`Expires`            |
 | `stale_while_revalidate`      | `0` (off)              | Serve an expired entry while one background refresh runs                                  |
 | `stale_if_error`              | `0` (off)              | Retain expired entries this long as upstream-failure fallback (see below)                 |
-| `revalidate_timeout`          | `30s`                  | Bound on any single upstream revalidation — a hung origin can't pin the coalescing flight; `0` = unbounded |
+| `revalidate_timeout`          | `30s`                  | Bound on any single upstream revalidation (`0` = unbounded)                               |
 | `cache_key`                   | `{host}{requestURI}`   | Cache key as a caddy placeholder template, e.g. `{http.request.host}{http.request.uri.path}` |
 | `match_header`                | none                   | Store only responses whose header `<name>` equals one of the given values (repeatable)    |
 | `vary`                        | none                   | Whitelist of `Vary` header names to key on                                                |
@@ -402,12 +402,12 @@ the within-run ratio:
 | nginx proxy_cache     | 210,033   | 239,964     | 246,589     | 264,490     | 263,396     | 267,827     |
 | **fastcache**         | 134,996   | 167,744     | 178,352     | 174,959     | 210,887     | **249,907** |
 | caddy `file_server`   | 44,546    | 51,357      | 54,130      | 56,742      | 128,380     | 129,287     |
-| souin+simplefs        | 40,461    | 49,172      | 48,606      | 55,847      | 115,455     | 115,137     |
+| souin                 | 40,461    | 49,172      | 48,606      | 55,847      | 115,455     | 115,137     |
 
 | ratio                      | run 1 | run 2 | run 3 | run 4*  | run 5†  | run 6‡   |
 |----------------------------|-------|-------|-------|---------|---------|----------|
 | fastcache / nginx          | 64%   | 70%   | 72%   | 66%     | 80%     | **93%**  |
-| fastcache / souin+simplefs | 3.3×  | 3.4×  | 3.7×  | 3.1×    | 1.8×    | 2.2×     |
+| fastcache / souin          | 3.3×  | 3.4×  | 3.7×  | 3.1×    | 1.8×    | 2.2×     |
 | fastcache / file_server    | 3.0×  | 3.3×  | 3.3×  | 3.1×    | 1.6×    | 1.9×     |
 
 \* run 4 on an idle machine (all desktop apps closed), 60s wrk legs —
@@ -468,7 +468,7 @@ default (the 3 MiB body stays disk-backed → every hit sendfiles):
 | **fastcache**         | **2,979**| **9,004** | 6.5ms    | 15.3ms  |
 | nginx proxy_cache     | 1,738    | 5,416     | 23.0ms   | 175.6ms |
 | caddy `file_server`   | 2,147    | 4,313     | 25.9ms   | 135.1ms |
-| souin+simplefs        | 1,613    | 2,079     | 32.6ms   | 103.3ms |
+| souin                 | 1,613    | 2,079     | 32.6ms   | 103.3ms |
 
 **1.7× nginx, 4.3× souin.** Once the body is large, per-request cost is the
 payload copy, not middleware: souin must copy 3 MiB through Go heap on every
@@ -485,7 +485,7 @@ bash bench/run.sh         # end-to-end bench (see bench/README below)
 
 ### bench/ layout
 
-Ports: backend **9081**, souin+simplefs **9080** (optional), nginx **9082**,
+Ports: backend **9081**, souin **9080** (optional), nginx **9082**,
 fastcache **9083**, `file_server` baseline **9084**. `run.sh` builds the
 backend, an xcaddy caddy with this module, optionally a souin caddy (needs a
 `../storages` checkout; `WITH_SOUIN=0` skips it), and user-land nginx+wrk via
