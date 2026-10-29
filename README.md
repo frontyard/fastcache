@@ -66,6 +66,7 @@ into the cache while streaming it to the client.
 | `ttl`                         | `1h`                   | Fallback freshness when the response carries no `max-age`/`s-maxage`/`Expires`            |
 | `stale_while_revalidate`      | `0` (off)              | Serve an expired entry while one background refresh runs                                  |
 | `stale_if_error`              | `0` (off)              | Retain expired entries this long as upstream-failure fallback (see below)                 |
+| `revalidate_timeout`          | `30s`                  | Bound on any single upstream revalidation — a hung origin can't pin the coalescing flight; `0` = unbounded |
 | `cache_key`                   | `{host}{requestURI}`   | Cache key as a caddy placeholder template, e.g. `{http.request.host}{http.request.uri.path}` |
 | `match_header`                | none                   | Store only responses whose header `<name>` equals one of the given values (repeatable)    |
 | `vary`                        | none                   | Whitelist of `Vary` header names to key on                                                |
@@ -135,7 +136,8 @@ https://example.com {
 ### PURGE
 
 `PURGE <uri>` evicts all variants of a key. Without `purge_allow` only loopback
-clients may purge; other peers get `403`. The check runs against `RemoteAddr` —
+clients may purge; other peers get `403` with `Cache-Status: fastcache;
+fwd=request; detail=purge-denied`. The check runs against `RemoteAddr` —
 when Caddy sits behind a reverse proxy, allowlist the proxy's CIDR. Responds
 `200` with `Cache-Status: fastcache; purged`, or `404` with `Cache-Status:
 fastcache; fwd=purge-miss` when nothing was stored. A PURGE also aborts any
@@ -146,9 +148,10 @@ A richer purge surface is exposed on caddy's **admin endpoint** (module
 `admin.api.fastcache`, inheriting the admin listener's access control —
 loopback by default):
 
-- `GET /fastcache/keys` — list all cached base keys across instances
+- `GET /fastcache/keys` — list all cached base keys across instances, sorted
 - `DELETE /fastcache/purge` with `{"pattern": "<RE2>"}` — evict every base
-  key matching the regex (all variants), e.g. `{"pattern": "/static/"}`
+  key matching the regex (all variants), e.g. `{"pattern": "/static/"}`.
+  The request body is capped at 1MB and `pattern` must be a valid RE2.
 
 ### Stale modes
 
@@ -166,23 +169,36 @@ retention window: an entry lives until `expiry + max(swr, sie)`.
 - Revalidation is **conditional**: stored `ETag`/`Last-Modified` validators
   are sent as `If-None-Match`/`If-Modified-Since`, and a `304` merges the new
   headers and freshness into the entry in place (RFC 9111 §4.3.4) — no body
-  re-fetch.
-- `must-revalidate`/`proxy-revalidate` entries are never served stale: no
-  SWR grace, no SIE fallback — upstream errors pass through.
+  re-fetch. A 304 only merges when it answers the entry's own validators or
+  a client `If-None-Match` naming the stored ETag; a bare `*` proves a
+  representation exists upstream, not that ours is current, so it is never
+  merged.
+- Every revalidation — background refresh or synchronous — is bounded by
+  `revalidate_timeout` on a context detached from the triggering request,
+  so a hung upstream can't leak the goroutine or pin the coalescing flight.
+- `must-revalidate`/`proxy-revalidate`/`s-maxage` entries are never served
+  stale: no SWR grace, no SIE fallback — upstream errors pass through
+  (`s-maxage` implies `proxy-revalidate` for a shared cache, RFC 9111
+  §5.2.2.10).
 
 ### HTTP semantics
 
-- **Bypassed:** non-GET/HEAD methods, requests with `Authorization`, `Upgrade`,
-  and (only with `honor_request_cache_control`) client `Cache-Control:
-  no-cache`/`no-store`/`Pragma: no-cache`. Unsafe methods additionally
+- **Bypassed:** non-GET/HEAD methods, requests with `Authorization`,
+  `Proxy-Authorization`, `Upgrade`, and (only with
+  `honor_request_cache_control`) client `Cache-Control:
+  no-cache`/`no-store`/`Pragma: no-cache` (matched per-token, so
+  `Pragma: foo, no-cache` still bypasses). Unsafe methods additionally
   **invalidate** the request URI's cached variants on a non-error (<400)
-  upstream response (RFC 9111 §4.4).
+  upstream response, plus the variants of any `Location`/`Content-Location`
+  URIs the response points at (RFC 9111 §4.4).
 - **Stored:** responses to GET/HEAD that are cacheable under the shared-cache
   rules and carry a heuristically cacheable status (RFC 9111 §3): `200, 203,
   204, 300, 301, 308, 404, 405, 410, 414, 501`. `206` is deliberately excluded —
   a partial body must never become a stored variant. Upstream `no-store`,
-  `private`, `Vary: *`, and `Set-Cookie` are respected (the last unless
-  `store_set_cookie` is set). Responses with non-positive freshness
+  `private`, `no-cache`, `Vary: *`, and `Set-Cookie` are respected (the last
+  unless `store_set_cookie` is set). A response `no-cache` is never stored —
+  it forbids reuse without successful revalidation, which the index has no
+  entry to hang on. Responses with non-positive freshness
   (`max-age=0`, a past `Expires`) are never stored — so they get no
   stale_if_error fallback either. OPTIONS/TRACE bypass the cache without
   invalidating; only GET responses populate entries (HEAD hits are served
@@ -195,14 +211,24 @@ retention window: an entry lives until `expiry + max(swr, sie)`.
   → configured `ttl`. An upstream `Age` header is folded into the stored
   timestamps, so freshness is not overextended.
 - **match_header** rules gate storage on *response* headers — `match_header
-  Content-Type image/png image/jpeg` caches only those content types.
-  (Request-side matching — paths, methods — belongs to caddy's own route
-  matchers; just place `fastcache` inside a `handle` block.)
+  Content-Type image/png image/jpeg` caches only those content types. At
+  least one value is required. (Request-side matching — paths, methods —
+  belongs to caddy's own route matchers; just place `fastcache` inside a
+  `handle` block.)
 - **cache_key** accepts caddy placeholders resolved per request, e.g.
   `cache_key {http.request.host}{http.request.uri.path}` to ignore the query
   string, or add `{http.request.method}`/header values to split entries.
 - **Conditionals:** `If-None-Match` uses weak comparison (`W/"x"` matches
-  `"x"`); `Range` requests on hits are honored via `http.ServeContent`.
+  `"x"`); `If-Match` uses strong comparison — a weak stored ETag satisfies
+  nothing, `*` matches any stored entity, and a mismatch is a `412`.
+  `Range` requests on hits are honored via `http.ServeContent`. The `Age`
+  header is set before conditional evaluation, so 304s carry it too.
+- **Hop-by-hop fields:** the static list (`Connection`, `Keep-Alive`,
+  `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`,
+  `Transfer-Encoding`, `Upgrade`) plus fields the upstream's `Connection`
+  header nominates are stripped before the response reaches the client and
+  before it is stored. A handler that hijacks the connection mid-response
+  aborts the capture — the truncated body is never committed.
 - **Cache-Status** (RFC 9211) reports how each response was reached:
   `hit; ttl=N`, `hit; fwd=stale` (stale serve + revalidation),
   `fwd=uri-miss; stored; key="…"` (stored miss), `fwd=request` (bypass),
@@ -262,7 +288,12 @@ entry — half-written bodies are orphaned and reaped on rebuild. Body
 filenames are `sha256(key)[:12]-<seq>` with `seq` seeded from the wall clock,
 so restarts can't collide and long URIs can't hit `ENAMETOOLONG`.
 `rebuild()` walks the shard tree at startup, reloads every complete entry, and
-deletes orphans and empty shard directories.
+deletes orphans and empty shard directories. Only the 2-hex shard
+directories are cache-owned — foreign files and subdirectories under `path`
+are left alone. Metas are bounded (≤1MiB) and validated before use, and
+conflicting `Vary` schemes resolve to the first-loaded meta rather than an
+unreachable index. Body and meta files are written `0640` (shard dirs
+`0750`).
 
 ### Concurrency
 
@@ -279,8 +310,14 @@ The hit path takes no locks:
   is promoted via `pread` from offset 0, with a `promoting` flag so only one
   concurrent hit does the read.
 - Misses are coalesced per key by a `flights` singleflight map; followers wait
-  on both completion and `r.Context()`, and fetch+capture themselves when the
-  leader's result doesn't cover them.
+  on both completion and `r.Context()`, then loop — re-serving the new entry
+  or leading/following the next flight. Waits are capped (`maxFlightRounds`),
+  after which a request fetches itself — so concurrent upstream fetches stay
+  bounded even when leaders keep finishing without covering the request
+  (uncacheable responses under churn). Revalidations coalesce under a
+  separate `reval:` flight shared by background refresh and synchronous
+  revalidation: at most one upstream validation per variant is ever in
+  flight.
 
 ### Eviction and expiry
 

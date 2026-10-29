@@ -1,12 +1,14 @@
 package fastcache
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -51,6 +53,7 @@ func newTestCache(t *testing.T, mutate func(*FastCache)) *FastCache {
 	fc.ttl, _ = parseDuration(fc.TTL, 0)
 	fc.swr, _ = parseDuration(fc.StaleWhileRevalidate, 0)
 	fc.sie, _ = parseDuration(fc.StaleIfError, 0)
+	fc.revalidateTimeout, _ = parseDuration(fc.RevalidateTimeout, 30*time.Second)
 
 	fc.idx = newIndex(fc)
 	if err := fc.idx.rebuild(); err != nil {
@@ -2525,5 +2528,731 @@ func TestPromoteBelowZero(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Errorf("disk hit should not reach upstream, got %d", calls.Load())
+	}
+}
+
+// cacheFiles counts files directly inside shard directories under dir.
+func cacheFiles(t *testing.T, dir string) int {
+	t.Helper()
+
+	n := 0
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() && shardDirRe.MatchString(filepath.Base(filepath.Dir(p))) {
+			n++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return n
+}
+
+// TestCommitReplaceNoLeak: when a commit replaces a live variant (a 200
+// answer to a conditional revalidation is the common trigger), the
+// replaced entry's files must be removed and its accounting dropped —
+// removeEntry's CAS cannot fire because entries already holds the new one.
+func TestCommitReplaceNoLeak(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleIfError = "5s"
+	})
+
+	var calls atomic.Int64
+	body := "v1"
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public") // freshness = configured TTL (50ms)
+		_, _ = w.Write([]byte(body))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next) // stores v1
+
+	before := fc.idx.diskSize.Load()
+	if files := cacheFiles(t, fc.Path); files != 2 {
+		t.Fatalf("expected 2 files (body+meta) after store, got %d", files)
+	}
+
+	time.Sleep(80 * time.Millisecond)
+
+	body = "v2"
+	w := get(t, fc, "/", nil, next) // SIE revalidation, 200 replaces entry
+	if w.Body.String() != "v2" {
+		t.Fatalf("expected v2, got %q", w.Body.String())
+	}
+
+	if got := fc.idx.fileCount.Load(); got != 1 {
+		t.Errorf("fileCount = %d, want 1 (replaced variant leaked)", got)
+	}
+	if got := fc.idx.diskSize.Load(); got != before {
+		t.Errorf("diskSize = %d, want %d (replaced variant still counted)", got, before)
+	}
+	if files := cacheFiles(t, fc.Path); files != 2 {
+		t.Errorf("expected 2 files on disk after replace, got %d", files)
+	}
+}
+
+// TestNoCacheNotStored: Cache-Control: no-cache forbids reuse without
+// successful revalidation — the cache stores nothing, so every request
+// reaches upstream.
+func TestNoCacheNotStored(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, []byte("x"), http.Header{"Cache-Control": {"public, no-cache"}})
+
+	get(t, fc, "/", nil, next)
+	w := get(t, fc, "/", nil, next)
+
+	if strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+		t.Fatal("no-cache response was served from cache")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("no-cache response should revalidate upstream every time, got %d calls", calls.Load())
+	}
+}
+
+// TestSMaxAgeNoStale: s-maxage implies proxy-revalidate for a shared cache
+// (RFC 9111 §5.2.2.10) — an s-maxage entry past its freshness must
+// revalidate synchronously, never serve stale even inside an SWR window.
+func TestSMaxAgeNoStale(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.StaleWhileRevalidate = "5s"
+		fc.StaleIfError = "10s"
+	})
+
+	var calls atomic.Int64
+	body := "v1"
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, s-maxage=1")
+		_, _ = w.Write([]byte(body))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(1100 * time.Millisecond)
+
+	body = "v2"
+	w := get(t, fc, "/", nil, next)
+
+	if w.Body.String() != "v2" {
+		t.Fatalf("s-maxage entry served stale %q inside SWR window", w.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected synchronous revalidation, got %d calls", calls.Load())
+	}
+}
+
+// TestHopByHopNotForwarded: every hop-by-hop field — the static list, not
+// just Connection-nominated ones — must be stripped before the upstream
+// response reaches the client.
+func TestHopByHopNotForwarded(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Keep-Alive", "timeout=5")
+		w.Header().Set("Upgrade", "h2c")
+		w.Header().Set("Proxy-Authenticate", "Basic realm=up")
+		w.Header().Set("Te", "trailers")
+		w.Header().Set("Trailer", "X-T")
+		w.Header().Set("Connection", "X-Internal")
+		w.Header().Set("X-Internal", "secret")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("x"))
+
+		return nil
+	})
+
+	w1 := get(t, fc, "/", nil, next)
+	w2 := get(t, fc, "/", nil, next)
+	if calls.Load() != 1 {
+		t.Fatalf("expected stored response, got %d calls", calls.Load())
+	}
+
+	for _, w := range []*httptest.ResponseRecorder{w1, w2} {
+		for _, h := range []string{"Keep-Alive", "Upgrade", "Proxy-Authenticate", "Te", "Trailer", "Connection", "X-Internal"} {
+			if w.Header().Get(h) != "" {
+				t.Errorf("hop-by-hop header %q reached the client", h)
+			}
+		}
+	}
+}
+
+// hijackRW makes a ResponseRecorder hijackable over a net.Pipe.
+type hijackRW struct {
+	http.ResponseWriter
+	c net.Conn
+}
+
+func (h *hijackRW) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return h.c, bufio.NewReadWriter(bufio.NewReader(h.c), bufio.NewWriter(h.c)), nil
+}
+
+// TestHijackDiscards: a handler that hijacks the connection mid-capture
+// must never commit — an undeclared-length body would otherwise be stored
+// truncated.
+func TestHijackDiscards(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		n := calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial"))
+		if n == 1 {
+			c, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				return err
+			}
+
+			return c.Close()
+		}
+
+		return nil
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	server, _ := net.Pipe()
+	w := &hijackRW{ResponseWriter: httptest.NewRecorder(), c: server}
+	defer func() { _ = server.Close() }()
+
+	if err := fc.ServeHTTP(w, r, next); err != nil {
+		t.Fatal(err)
+	}
+
+	// The hijacked capture must be gone — nothing may reach the index.
+	if _, _, ok := fc.idx.lookup(r); ok {
+		t.Fatal("hijacked capture was committed")
+	}
+
+	// A normal fetch stores and then serves hits.
+	get(t, fc, "/", nil, next)
+	if w := get(t, fc, "/", nil, next); !strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+		t.Fatalf("expected hit, got %q", w.Header().Get("Cache-Status"))
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 upstream calls, got %d", calls.Load())
+	}
+}
+
+// TestRefreshTimeout: a background revalidation is bounded by
+// revalidate_timeout — a hung upstream can't pin the flight forever.
+func TestRefreshTimeout(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleWhileRevalidate = "5s"
+		fc.RevalidateTimeout = "60ms"
+	})
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		n := calls.Add(1)
+		if n == 1 {
+			w.Header().Set("Cache-Control", "public, max-age=1")
+			_, _ = w.Write([]byte("v1"))
+
+			return nil
+		}
+
+		// Refresh fetches block until the detached context times out.
+		<-r.Context().Done()
+
+		return r.Context().Err()
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(80 * time.Millisecond)
+
+	// Each stale hit re-arms the refresh; while refresh #1 still blocks, the
+	// "reval:" flight suppresses new fetches. Once the timeout kills it, the
+	// next stale hit launches refresh #2.
+	waitFor(t, "a second refresh after timeout", func() bool {
+		get(t, fc, "/", nil, next)
+
+		return calls.Load() >= 3
+	})
+}
+
+// TestMissFollowerNoHerd: when the leader's response is not cacheable,
+// followers must serialize through subsequent flights instead of all
+// fetching upstream concurrently.
+func TestMissFollowerNoHerd(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls, inflight, maxInflight atomic.Int64
+	release := make(chan struct{})
+
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		calls.Add(1)
+		cur := inflight.Add(1)
+		for {
+			m := maxInflight.Load()
+			if cur <= m || maxInflight.CompareAndSwap(m, cur) {
+				break
+			}
+		}
+		<-release
+		inflight.Add(-1)
+
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte("x"))
+
+		return nil
+	})
+
+	const n = 3 // < maxFlightRounds so all requests stay flight-coalesced
+
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+			_ = fc.ServeHTTP(httptest.NewRecorder(), r, next)
+		}()
+	}
+	close(start)
+
+	// Wait for followers to pile up, then release fetches one at a time.
+	time.Sleep(50 * time.Millisecond)
+	for range n {
+		release <- struct{}{}
+	}
+	wg.Wait()
+
+	if m := maxInflight.Load(); m > 1 {
+		t.Fatalf("followers fetched concurrently: max in-flight upstream = %d", m)
+	}
+}
+
+// TestSIEFollowerCoalesce: concurrent hits on a stale must-revalidate
+// entry coalesce into a single revalidation.
+func TestSIEFollowerCoalesce(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	release := make(chan struct{})
+
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=1, must-revalidate")
+		if n > 1 {
+			<-release
+		}
+		_, _ = w.Write([]byte("v"))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(1100 * time.Millisecond)
+
+	const n = 8
+
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			get(t, fc, "/", nil, next)
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 upstream calls (1 store + 1 coalesced revalidation), got %d", calls.Load())
+	}
+}
+
+// TestRebuildForeignShardNames: a file named like a fastcache file but
+// inside a foreign subdirectory must survive rebuild.
+func TestRebuildForeignShardNames(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	foreign := filepath.Join(fc.Path, "otherapp", "0123456789abcdef01234567-1")
+	if err := os.MkdirAll(filepath.Dir(foreign), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(foreign, []byte("keep me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fc.idx.stop()
+
+	fc2 := &FastCache{Path: fc.Path, MemorySize: "64MB", DiskSize: "1GB", TTL: "1h"}
+	fc2.memoryBytes, _ = parseSize(fc2.MemorySize, 0)
+	fc2.diskBytes, _ = parseSize(fc2.DiskSize, 0)
+	fc2.idx = newIndex(fc2)
+	if err := fc2.idx.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	defer fc2.idx.stop()
+
+	if _, err := os.Stat(foreign); err != nil {
+		t.Error("cachefile-named foreign file was reaped on rebuild")
+	}
+}
+
+// TestRebuildVaryConflict: two metas for the same base key disagreeing on
+// VaryHeaders — the first-loaded scheme wins, the conflicting entry is
+// dropped instead of indexed unreachable.
+func TestRebuildVaryConflict(t *testing.T) {
+	dir := t.TempDir()
+	shard := filepath.Join(dir, "ab")
+	if err := os.MkdirAll(shard, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	write := func(name string, m *metaHeader) {
+		t.Helper()
+		body := filepath.Join(shard, name)
+		if err := os.WriteFile(body, []byte("x"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		mf, err := os.OpenFile(body+".meta", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeMeta(mf, m); err != nil {
+			t.Fatal(err)
+		}
+		_ = mf.Close()
+	}
+
+	now := time.Now().UnixNano()
+	write("aabbccddeeff001122334455-1", &metaHeader{
+		Key: "example.com/x", VaryHeaders: []string{"A"}, VaryKey: "1:A1:v1;",
+		Status: 200, Headers: map[string][]string{"A": {"v1"}},
+		StoredAt: now, ExpiresAt: now + int64(time.Hour), StaleAt: now + int64(time.Hour),
+	})
+	write("bbccddeeff00112233445566-2", &metaHeader{
+		Key: "example.com/x", VaryHeaders: []string{"B"}, VaryKey: "1:B1:v2;",
+		Status: 200, Headers: map[string][]string{"B": {"v2"}},
+		StoredAt: now, ExpiresAt: now + int64(time.Hour), StaleAt: now + int64(time.Hour),
+	})
+
+	fc := &FastCache{Path: dir, MemorySize: "64MB", DiskSize: "1GB", TTL: "1h"}
+	fc.memoryBytes, _ = parseSize(fc.MemorySize, 0)
+	fc.diskBytes, _ = parseSize(fc.DiskSize, 0)
+	ix := newIndex(fc)
+	if err := ix.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	defer ix.stop()
+
+	if got := ix.fileCount.Load(); got != 1 {
+		t.Fatalf("conflicting metas should index one entry, got %d", got)
+	}
+	if files := cacheFiles(t, dir); files != 2 {
+		t.Errorf("conflicting entry's files should be dropped, got %d files", files)
+	}
+}
+
+// TestVaryOrderStable: the Vary list's order is canonicalized at capture —
+// an upstream reordering must not drop existing variants.
+func TestVaryOrderStable(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.Vary = []string{"X-A", "X-B"} })
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		n := calls.Add(1)
+		if n%2 == 0 {
+			w.Header().Set("Vary", "X-B, X-A") // reversed order
+		} else {
+			w.Header().Set("Vary", "X-A, X-B")
+		}
+		_, _ = w.Write([]byte("v" + r.Header.Get("X-A") + r.Header.Get("X-B")))
+
+		return nil
+	})
+
+	h1 := http.Header{"X-A": {"1"}, "X-B": {"1"}}
+	h2 := http.Header{"X-A": {"2"}, "X-B": {"2"}}
+
+	get(t, fc, "/", h1, next) // stores under [X-A X-B]
+	get(t, fc, "/", h2, next) // stores under reordered Vary — same scheme
+
+	if w := get(t, fc, "/", h1, next); !strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+		t.Fatalf("Vary reorder dropped the first variant, got %q", w.Header().Get("Cache-Status"))
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 upstream calls, got %d", calls.Load())
+	}
+}
+
+// TestIfMatch: If-Match uses strong comparison; a mismatch is a 412, "*"
+// matches any stored entity, and a weak stored ETag matches nothing.
+func TestIfMatch(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, []byte("x"), http.Header{"Cache-Control": {"public, max-age=3600"}, "ETag": {`"v1"`}})
+
+	get(t, fc, "/", nil, next)
+
+	req := func(h http.Header) *httptest.ResponseRecorder {
+		return get(t, fc, "/", h, next)
+	}
+
+	if w := req(http.Header{"If-Match": {`"nope"`}}); w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("If-Match mismatch: got %d, want 412", w.Code)
+	}
+	if w := req(http.Header{"If-Match": {`"v1"`}}); w.Code != http.StatusOK {
+		t.Fatalf("If-Match match: got %d, want 200", w.Code)
+	}
+	if w := req(http.Header{"If-Match": {"*"}}); w.Code != http.StatusOK {
+		t.Fatalf("If-Match *: got %d, want 200", w.Code)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("conditionals should hit the cache, got %d calls", calls.Load())
+	}
+
+	// * matches any current representation — even one stored without an
+	// ETag.
+	fc2 := newTestCache(t, nil)
+	var calls2 atomic.Int64
+	next2 := countingUpstream(&calls2, []byte("y"), http.Header{"Cache-Control": {"public, max-age=3600"}})
+	get(t, fc2, "/", nil, next2)
+	if w := get(t, fc2, "/", http.Header{"If-Match": {"*"}}, next2); w.Code != http.StatusOK {
+		t.Fatalf("If-Match * on etag-less entry: got %d, want 200", w.Code)
+	}
+}
+
+// TestIfNoneMatchStarNoMerge: a client's If-None-Match: * only proves a
+// representation exists upstream — a 304 for it must not merge freshness
+// into our stored entry.
+func TestIfNoneMatchStarNoMerge(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleIfError = "10s"
+	})
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		if r.Header.Get("If-None-Match") != "" {
+			w.WriteHeader(http.StatusNotModified)
+
+			return nil
+		}
+		w.Header().Set("Cache-Control", "public") // freshness = configured TTL (50ms)
+		w.Header().Set("ETag", `"v1"`)
+		_, _ = w.Write([]byte("body"))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(80 * time.Millisecond)
+
+	// Past expiry: client's * is forwarded upstream, 304 comes back and is
+	// forwarded — but must not be merged into the entry.
+	w := get(t, fc, "/", http.Header{"If-None-Match": {"*"}}, next)
+	if w.Code != http.StatusNotModified {
+		t.Fatalf("expected client's 304 forwarded, got %d", w.Code)
+	}
+
+	_, stale, ok := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	if !ok || !stale {
+		t.Fatal("*-only 304 must not refresh the stored entry")
+	}
+}
+
+// TestRefresh304Deleted: a 304 merge landing after the entry was purged
+// must not resurrect the meta sidecar.
+func TestRefresh304Deleted(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleWhileRevalidate = "5s"
+	})
+
+	var calls atomic.Int64
+	release := make(chan struct{})
+
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "public") // freshness = configured TTL (50ms)
+		w.Header().Set("ETag", `"v1"`)
+		if n == 1 {
+			_, _ = w.Write([]byte("body"))
+
+			return nil
+		}
+
+		<-release
+		w.WriteHeader(http.StatusNotModified)
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(80 * time.Millisecond)
+
+	get(t, fc, "/", nil, next) // stale serve; refresh blocks on release
+	waitFor(t, "refresh to reach upstream", func() bool { return calls.Load() == 2 })
+
+	// Purge while the revalidation is in flight, then let the 304 land.
+	fc.idx.purge(fc.idx.baseKey(httptest.NewRequest(http.MethodGet, "http://example.com/", nil)), "purge")
+	close(release)
+
+	waitFor(t, "refresh goroutine to finish", func() bool {
+		done := true
+		fc.flights.Range(func(_, _ any) bool { done = false; return false })
+
+		return done
+	})
+
+	if files := cacheFiles(t, fc.Path); files != 0 {
+		t.Errorf("purge raced 304 merge left %d files behind", files)
+	}
+}
+
+// TestProxyAuthorizationBypass: proxy credentials mark the request as
+// connection-specific — its response must not be stored or served.
+func TestProxyAuthorizationBypass(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, []byte("x"), http.Header{"Cache-Control": {"public, max-age=3600"}})
+
+	h := http.Header{"Proxy-Authorization": {"Basic Zm9v"}}
+	get(t, fc, "/", h, next)
+	w := get(t, fc, "/", h, next)
+
+	if strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+		t.Fatal("response to Proxy-Authorization request was served from cache")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 upstream calls, got %d", calls.Load())
+	}
+}
+
+// TestPragmaMultiToken: Pragma: no-cache is honored as a bypass even
+// inside a multi-token value when honor_request_cache_control is set.
+func TestPragmaMultiToken(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.HonorRequestCC = true })
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, []byte("x"), http.Header{"Cache-Control": {"public, max-age=3600"}})
+
+	h := http.Header{"Pragma": {"foo=1, no-cache"}}
+	get(t, fc, "/", h, next)
+	get(t, fc, "/", h, next)
+
+	if calls.Load() != 2 {
+		t.Fatalf("multi-token Pragma: no-cache did not bypass, got %d calls", calls.Load())
+	}
+}
+
+// TestMatchHeaderRequiresValues: match_header with no values is a config
+// error, not a silent "cache nothing" rule.
+func TestMatchHeaderRequiresValues(t *testing.T) {
+	d := caddyfile.NewTestDispenser("fastcache {\n\tmatch_header X-Only\n}")
+	var fc FastCache
+	if err := fc.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("match_header with no values should be an error")
+	}
+}
+
+// TestPurgeLocationInvalidation: a non-error unsafe-method response
+// invalidates not just the request URI but also its Location and
+// Content-Location targets (RFC 9111 §4.4).
+func TestPurgeLocationInvalidation(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		if r.Method == http.MethodPost {
+			w.Header().Set("Location", "/created")
+			w.Header().Set("Content-Location", "/item/1")
+			w.WriteHeader(http.StatusCreated)
+
+			return nil
+		}
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = w.Write([]byte("x"))
+
+		return nil
+	})
+
+	get(t, fc, "/created", nil, next)
+	get(t, fc, "/item/1", nil, next)
+	get(t, fc, "/u", nil, next)
+	if calls.Load() != 3 {
+		t.Fatalf("setup stores failed: %d calls", calls.Load())
+	}
+
+	r := httptest.NewRequest(http.MethodPost, "http://example.com/u", nil)
+	if err := fc.ServeHTTP(httptest.NewRecorder(), r, next); err != nil {
+		t.Fatal(err)
+	}
+
+	// The request URI plus both pointed-at URIs must re-fetch.
+	for _, p := range []string{"/u", "/created", "/item/1"} {
+		if w := get(t, fc, p, nil, next); strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+			t.Errorf("%s still served after invalidation", p)
+		}
+	}
+
+	if calls.Load() != 7 {
+		t.Fatalf("expected 7 upstream calls, got %d", calls.Load())
+	}
+}
+
+// TestReadMetaOversize: a meta sidecar beyond the gob length cap is
+// rejected by stat size alone — never read into memory — and reaped.
+func TestReadMetaOversize(t *testing.T) {
+	dir := t.TempDir()
+	shard := filepath.Join(dir, "ab")
+	if err := os.MkdirAll(shard, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	big := filepath.Join(shard, "aabbccddeeff001122334455-1.meta")
+	if err := os.WriteFile(big, bytes.Repeat([]byte("x"), 2<<20), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	ix := newIndex(&FastCache{Path: dir})
+	if err := ix.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	defer ix.stop()
+
+	if ix.fileCount.Load() != 0 {
+		t.Fatalf("oversized meta was indexed: %d entries", ix.fileCount.Load())
+	}
+	if _, err := os.Stat(big); !os.IsNotExist(err) {
+		t.Error("oversized meta was not reaped")
+	}
+}
+
+// TestRevalidateTimeoutOption parses the new knob.
+func TestRevalidateTimeoutOption(t *testing.T) {
+	d := caddyfile.NewTestDispenser("fastcache {\n\trevalidate_timeout 45s\n}")
+	var fc FastCache
+	if err := fc.UnmarshalCaddyfile(d); err != nil {
+		t.Fatal(err)
+	}
+	if fc.RevalidateTimeout != "45s" {
+		t.Fatalf("revalidate_timeout = %q", fc.RevalidateTimeout)
 	}
 }

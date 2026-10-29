@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-// hopHeaders are connection-scoped headers never stored nor replayed.
+// hopHeaders are connection-scoped headers never stored nor replayed to
+// the client (RFC 9110 §7.6.1). Content-Length is deliberately absent: it
+// is hop-by-hop only for storage (recomputed on serve) but must forward
+// intact on a live upstream response.
 var hopHeaders = map[string]bool{
 	"Connection":          true,
 	"Keep-Alive":          true,
@@ -18,7 +21,6 @@ var hopHeaders = map[string]bool{
 	"Trailer":             true,
 	"Transfer-Encoding":   true,
 	"Upgrade":             true,
-	"Content-Length":      true, // recomputed on serve
 }
 
 // requestBypass reports whether the request must skip the cache read path.
@@ -27,7 +29,9 @@ func requestBypass(ix *index, r *http.Request) bool {
 		return true
 	}
 
-	if r.Header.Get("Authorization") != "" {
+	// Proxy-Authorization is hop-by-hop proxy credentials: like
+	// Authorization, its response must not become a shared entry.
+	if r.Header.Get("Authorization") != "" || r.Header.Get("Proxy-Authorization") != "" {
 		return true
 	}
 
@@ -46,8 +50,10 @@ func requestBypass(ix *index, r *http.Request) bool {
 		return true
 	}
 
-	if strings.EqualFold(r.Header.Get("Pragma"), "no-cache") {
-		return true
+	for tok := range strings.SplitSeq(r.Header.Get("Pragma"), ",") {
+		if strings.EqualFold(strings.TrimSpace(tok), "no-cache") {
+			return true
+		}
 	}
 
 	return false
@@ -122,9 +128,7 @@ func responseCacheable(ix *index, r *http.Request, status int, h http.Header) (f
 		return 0, 0, nil, false, false
 	}
 
-	if _, mr = cc["must-revalidate"]; !mr {
-		_, mr = cc["proxy-revalidate"]
-	}
+	mr = mustRevalidate(cc)
 
 	vary := strings.Join(h.Values("Vary"), ",")
 	if vary != "" {
@@ -152,6 +156,11 @@ func responseCacheable(ix *index, r *http.Request, status int, h http.Header) (f
 		}
 	}
 
+	// Canonicalize the list: the stored mapping compares it by equality,
+	// so an upstream that orders Vary differently per response must not
+	// look like a scheme change.
+	varyHeaders = slices.Compact(slices.Sorted(slices.Values(varyHeaders)))
+
 	fresh = freshness(ix, h)
 
 	return fresh, ix.swr, varyHeaders, mr, true
@@ -163,6 +172,13 @@ func responseCacheable(ix *index, r *http.Request, status int, h http.Header) (f
 // age, capped at the default TTL), then the configured default.
 func freshness(ix *index, h http.Header) time.Duration {
 	if cc := responseCC(h); len(cc) > 0 {
+		// The no-cache response directive forbids reuse without successful
+		// revalidation (RFC 9111 §5.2.2.4) — zero freshness is never stored,
+		// and a 304 merge carrying it turns the entry instantly stale.
+		if _, ok := cc["no-cache"]; ok {
+			return 0
+		}
+
 		maxAge := -1
 		if v, ok := cc["s-maxage"]; ok {
 			maxAge, _ = strconv.Atoi(v)
@@ -205,6 +221,22 @@ func freshness(ix *index, h http.Header) time.Duration {
 	return ix.defaultTTL
 }
 
+// mustRevalidate reports whether the response directives forbid serving
+// the stored response stale: must-revalidate, proxy-revalidate, or
+// s-maxage — which implies proxy-revalidate for a shared cache
+// (RFC 9111 §5.2.2.10).
+func mustRevalidate(cc map[string]string) bool {
+	if _, ok := cc["must-revalidate"]; ok {
+		return true
+	}
+	if _, ok := cc["proxy-revalidate"]; ok {
+		return true
+	}
+	_, ok := cc["s-maxage"]
+
+	return ok
+}
+
 // connHeaderTokens returns the field names a response nominates as
 // hop-by-hop via its Connection header (RFC 9110 §7.6.1).
 func connHeaderTokens(h http.Header) map[string]bool {
@@ -233,7 +265,7 @@ func cacheableHeaders(h http.Header) http.Header {
 
 	for k, vv := range h {
 		ck := http.CanonicalHeaderKey(k)
-		if hopHeaders[ck] || connToks[ck] || strings.HasPrefix(k, http.TrailerPrefix) {
+		if hopHeaders[ck] || ck == "Content-Length" || connToks[ck] || strings.HasPrefix(k, http.TrailerPrefix) {
 			continue
 		}
 

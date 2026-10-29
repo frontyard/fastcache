@@ -51,14 +51,16 @@ type FastCache struct {
 	HonorRequestCC       bool                `json:"honor_request_cache_control,omitempty"`
 	PromoteBelow         string              `json:"promote_below,omitempty"`
 	StoreSetCookie       bool                `json:"store_set_cookie,omitempty"`
+	RevalidateTimeout    string              `json:"revalidate_timeout,omitempty"`
 
-	memoryBytes  int64
-	diskBytes    int64
-	promoteBelow int64
-	ttl          time.Duration
-	swr          time.Duration
-	sie          time.Duration
-	purgeNets    []netip.Prefix
+	memoryBytes       int64
+	diskBytes         int64
+	promoteBelow      int64
+	ttl               time.Duration
+	swr               time.Duration
+	sie               time.Duration
+	revalidateTimeout time.Duration
+	purgeNets         []netip.Prefix
 
 	idx     *index
 	flights sync.Map // flight key -> chan struct{}
@@ -104,6 +106,10 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("stale_if_error: %w", err)
 	}
 
+	if fc.revalidateTimeout, err = parseDuration(fc.RevalidateTimeout, 30*time.Second); err != nil {
+		return fmt.Errorf("revalidate_timeout: %w", err)
+	}
+
 	for name, v := range map[string]int64{
 		"memory_size": fc.memoryBytes, "disk_size": fc.diskBytes, "promote_below": fc.promoteBelow,
 	} {
@@ -113,6 +119,7 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 	}
 	for name, v := range map[string]time.Duration{
 		"ttl": fc.ttl, "stale_while_revalidate": fc.swr, "stale_if_error": fc.sie,
+		"revalidate_timeout": fc.revalidateTimeout,
 	} {
 		if v < 0 {
 			return fmt.Errorf("%s must be >= 0, got %s", name, v)
@@ -218,6 +225,33 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 
 		fc.idx.purge(fc.idx.baseKey(r), "invalidate")
 
+		// §4.4 also invalidates the URIs in the response's Location and
+		// Content-Location fields — only computable under the default
+		// host+requestURI key scheme.
+		if fc.idx.keyTmpl == "" {
+			for _, hdr := range []string{"Location", "Content-Location"} {
+				if loc := sw.Header().Get(hdr); loc != "" {
+					if ref, perr := r.URL.Parse(loc); perr == nil {
+						uri := ref.RequestURI()
+						if uri == "" {
+							continue // opaque URI — no origin-form to key on
+						}
+						host := ref.Host
+						if host == "" {
+							host = r.Host
+						}
+						fc.idx.purge(host+uri, "invalidate")
+						// Absolute-form requests (RequestURI carries the
+						// whole URI) store under host+full URI — purge that
+						// spelling too.
+						if full := ref.String(); full != uri {
+							fc.idx.purge(host+full, "invalidate")
+						}
+					}
+				}
+			}
+		}
+
 		return nil
 	}
 
@@ -228,10 +262,26 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		return next.ServeHTTP(w, r)
 	}
 
-	if e, stale, hit := fc.idx.lookup(r); hit {
-		if stale {
-			mr := e.mustRevalidate.Load()
+	// Followers loop instead of fetching directly: when the leader's
+	// outcome doesn't cover the request (uncacheable response, different
+	// variant, failed revalidation), rejoining — or leading — the next
+	// flight keeps concurrent upstream fetches bounded. Follower waits are
+	// capped, then the request fetches itself.
+	for tries := 0; ; tries++ {
+		e, stale, hit := fc.idx.lookup(r)
+		if hit {
+			if !stale {
+				fc.idx.metrics.req("hit")
 
+				cs := []string{"hit", ttlParam(e)}
+				if tries > 0 {
+					cs = append(cs, "collapsed")
+				}
+
+				return fc.serveEntry(w, r, e, next, cs...)
+			}
+
+			mr := e.mustRevalidate.Load()
 			if !mr && fc.idx.withinSWR(e, time.Now().UnixNano()) {
 				fc.refresh(e, r, next)
 				fc.idx.metrics.req("stale")
@@ -240,91 +290,70 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 			}
 
 			// Beyond the SWR window — or any stale entry forbidding stale
-			// serving — revalidate synchronously, coalesced. Without
-			// must-revalidate the stale entry is the error fallback
-			// (stale_if_error) and is served to followers immediately.
-			done, leader := fc.startFlight("sie:" + e.key)
-			if !leader {
-				if !mr {
-					fc.idx.metrics.req("stale")
+			// serving — revalidate synchronously, coalesced under the same
+			// flight key refresh() uses, so at most one revalidation per
+			// variant is ever in flight. Without must-revalidate the stale
+			// entry is the error fallback (stale_if_error) and is served to
+			// followers immediately.
+			done, leader := fc.startFlight("reval:" + e.key)
+			if leader {
+				fc.idx.metrics.req("revalidated")
+				err := fc.revalidateOrStale(w, r, e, next)
+				fc.finishFlight("reval:"+e.key, done)
 
-					return fc.serveEntry(w, r, e, next, "hit", "fwd=stale", "collapsed")
-				}
-
-				select {
-				case <-done:
-				case <-r.Context().Done():
-					return r.Context().Err()
-				}
-
-				if e2, stale2, hit2 := fc.idx.lookup(r); hit2 && !stale2 {
-					fc.idx.metrics.req("hit")
-
-					return fc.serveEntry(w, r, e2, next, "hit", "collapsed")
-				}
-
-				fc.idx.metrics.req("miss")
-
-				return fc.fetchAndStore(w, r, fc.idx.baseKey(r), next)
+				return err
 			}
 
-			defer fc.finishFlight("sie:"+e.key, done)
-			fc.idx.metrics.req("revalidated")
+			if !mr {
+				fc.idx.metrics.req("stale")
 
-			return fc.revalidateOrStale(w, r, e, next)
+				return fc.serveEntry(w, r, e, next, "hit", "fwd=stale", "collapsed")
+			}
+
+			select {
+			case <-done:
+			case <-r.Context().Done():
+				return r.Context().Err()
+			}
+
+			continue
 		}
 
-		fc.idx.metrics.req("hit")
+		// Miss coalescing: the leader fetches upstream and streams the
+		// response to its client while storing it; followers wait, then
+		// loop — re-serving the new entry or leading the next flight.
+		base := fc.idx.baseKey(r)
+		flightKey := base + "|" + varyKey(r, fc.varyHeadersOf(base))
 
-		return fc.serveEntry(w, r, e, next, "hit", ttlParam(e))
-	}
+		done, leader := fc.startFlight(flightKey)
+		if leader {
+			fc.idx.metrics.req("miss")
+			err := fc.fetchAndStore(w, r, base, next)
+			fc.finishFlight(flightKey, done)
 
-	// Miss coalescing: the leader fetches upstream and streams the response
-	// to its client while storing it; followers wait, then serve the entry.
-	base := fc.idx.baseKey(r)
-	flightKey := base + "|" + varyKey(r, fc.varyHeadersOf(base))
+			return err
+		}
 
-	done, leader := fc.startFlight(flightKey)
-	if !leader {
+		if tries >= maxFlightRounds {
+			// Leaders keep finishing without covering this request (e.g.
+			// uncacheable responses under churn): fetch directly rather
+			// than queue on yet another flight.
+			fc.idx.metrics.req("miss")
+
+			return fc.fetchAndStore(w, r, base, next)
+		}
+
 		select {
 		case <-done:
 		case <-r.Context().Done():
 			return r.Context().Err()
 		}
-
-		if e, stale, hit := fc.idx.lookup(r); hit {
-			if stale {
-				if e.mustRevalidate.Load() {
-					fc.idx.metrics.req("miss")
-
-					return fc.fetchAndStore(w, r, base, next)
-				}
-
-				if fc.idx.withinSWR(e, time.Now().UnixNano()) {
-					fc.refresh(e, r, next)
-					fc.idx.metrics.req("stale")
-
-					return fc.serveEntry(w, r, e, next, "hit", "fwd=stale", "collapsed")
-				}
-			}
-
-			fc.idx.metrics.req("hit")
-
-			return fc.serveEntry(w, r, e, next, "hit", "collapsed")
-		}
-
-		// The leader's response was not cacheable, or it was a different
-		// variant: fetch ourselves (and store if this one is cacheable).
-		fc.idx.metrics.req("miss")
-
-		return fc.fetchAndStore(w, r, base, next)
 	}
-
-	defer fc.finishFlight(flightKey, done)
-	fc.idx.metrics.req("miss")
-
-	return fc.fetchAndStore(w, r, base, next)
 }
+
+// maxFlightRounds caps how often a request may trail another request's
+// flight before fetching upstream itself.
+const maxFlightRounds = 3
 
 // fetchAndStore proxies to next through a captureWriter; a handler error
 // discards the capture.
@@ -365,14 +394,27 @@ func (fc *FastCache) revalidateOrStale(w http.ResponseWriter, r *http.Request, e
 // the revalidation carried our stored validators (the client sent no
 // If-None-Match, so revalRequest attached them), or the client's own
 // If-None-Match already names the stored ETag. A 304 for other client
-// validators only proves the client's copy fresh — it must not merge.
+// validators only proves the client's copy fresh — it must not merge, and
+// a bare "*" is no better: it proves a representation exists, not that
+// ours is the current one.
 func canMerge304(r *http.Request, e *entry) bool {
 	inm := r.Header.Get("If-None-Match")
 	if inm == "" {
 		return true
 	}
 
-	return etagMatches(inm, (*e.headers.Load()).Get("ETag"))
+	etag := strings.TrimPrefix((*e.headers.Load()).Get("ETag"), "W/")
+	if etag == "" {
+		return false
+	}
+
+	for t := range strings.SplitSeq(inm, ",") {
+		if strings.TrimPrefix(strings.TrimSpace(t), "W/") == etag {
+			return true
+		}
+	}
+
+	return false
 }
 
 // revalRequest clones r for upstream revalidation: client Range headers are
@@ -435,8 +477,10 @@ func (fc *FastCache) varyHeadersOf(base string) []string {
 
 // refresh re-fetches a stale entry in the background, conditionally when
 // the entry has validators (a 304 merges in place instead of re-storing the
-// body). Only one refresh per key runs at a time; the request context is
-// detached so it survives the caller's return.
+// body). Only one refresh per key runs at a time — it shares the "reval:"
+// flight key with synchronous revalidations. The request context is
+// detached so it survives the caller's return, but bounded by
+// revalidate_timeout so a hung upstream can't leak the goroutine forever.
 func (fc *FastCache) refresh(e *entry, r *http.Request, next caddyhttp.Handler) {
 	key := "reval:" + e.key
 
@@ -445,16 +489,28 @@ func (fc *FastCache) refresh(e *entry, r *http.Request, next caddyhttp.Handler) 
 		return
 	}
 
-	go func() {
-		defer fc.finishFlight(key, done)
+	// Everything derived from r happens before the goroutine: the request
+	// is not safe to read once ServeHTTP returns.
+	req := revalRequest(r, e)
+	ownVal := canMerge304(r, e)
 
-		req := revalRequest(r, e)
-		req = req.WithContext(context.WithoutCancel(r.Context()))
+	// Detached from the request so it survives the caller's return; a
+	// revalidate_timeout of 0 means unbounded.
+	ctx := context.WithoutCancel(r.Context())
+	var cancel context.CancelFunc = func() {}
+	if fc.revalidateTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, fc.revalidateTimeout)
+	}
+	req = req.WithContext(ctx)
+
+	go func() {
+		defer cancel()
+		defer fc.finishFlight(key, done)
 
 		cw := newCaptureWriter(fc, &discardRW{h: http.Header{}}, req, e.baseKey)
 		cw.reval = e
 		cw.next = next
-		cw.ownVal = canMerge304(r, e)
+		cw.ownVal = ownVal
 
 		err := next.ServeHTTP(cw, req)
 		cw.Close(err)
@@ -504,6 +560,20 @@ func (s *statusRW) Flush() {
 	}
 }
 
+// ReadFrom keeps the underlying writer's sendfile path available to
+// io.Copy through the wrapper on bypassed unsafe-method responses.
+func (s *statusRW) ReadFrom(src io.Reader) (int64, error) {
+	if !s.wrote {
+		s.WriteHeader(http.StatusOK)
+	}
+
+	if rf, ok := s.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
+
+	return io.Copy(s.ResponseWriter, src)
+}
+
 // Unwrap lets http.ResponseController reach the real writer (full-duplex
 // and deadline controls probe through it).
 func (s *statusRW) Unwrap() http.ResponseWriter { return s.ResponseWriter }
@@ -547,17 +617,27 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 
 	h["Cache-Status"] = []string{"fastcache; " + strings.Join(cs, "; ")}
 
+	// storedAt already embeds the upstream Age (see captureWriter.decide).
+	// Set it before the conditional early-returns so 304s carry it too.
+	if age := (time.Now().UnixNano() - e.storedAt.Load()) / int64(time.Second); age > 0 {
+		h["Age"] = []string{strconv.FormatInt(age, 10)}
+	}
+
+	// If-Match is evaluated before If-None-Match: a failed precondition
+	// (412) takes precedence over a not-modified answer (RFC 9110 §13.2.2).
+	// It takes strong comparison — a weak stored ETag can never satisfy it.
+	if im := r.Header.Get("If-Match"); im != "" && !etagStrongMatch(im, hdrs.Get("ETag")) {
+		w.WriteHeader(http.StatusPreconditionFailed)
+
+		return nil
+	}
+
 	if inm := r.Header.Get("If-None-Match"); inm != "" {
 		if etag := hdrs.Get("ETag"); etag != "" && etagMatches(inm, etag) {
 			w.WriteHeader(http.StatusNotModified)
 
 			return nil
 		}
-	}
-
-	// storedAt already embeds the upstream Age (see captureWriter.decide).
-	if age := (time.Now().UnixNano() - e.storedAt.Load()) / int64(time.Second); age > 0 {
-		h["Age"] = []string{strconv.FormatInt(age, 10)}
 	}
 
 	// Fast path: a plain GET/HEAD without Range or conditional headers does
@@ -623,6 +703,20 @@ func etagMatches(inm, etag string) bool {
 	return false
 }
 
+// etagStrongMatch evaluates If-Match (RFC 9110 §13.1.1): strong comparison
+// only — a weak stored ETag (W/"x") satisfies nothing, and "*" matches any
+// current representation (a cache hit means one exists, ETag or not).
+func etagStrongMatch(im, etag string) bool {
+	for t := range strings.SplitSeq(im, ",") {
+		v := strings.TrimSpace(t)
+		if v == "*" || (etag != "" && v == etag) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // compilePurgeAllow turns purge_allow strings (IPs or CIDRs) into prefixes.
 func (fc *FastCache) compilePurgeAllow() error {
 	for _, s := range fc.PurgeAllow {
@@ -673,6 +767,7 @@ func (fc *FastCache) purgeAllowed(r *http.Request) bool {
 
 func (fc *FastCache) handlePurge(w http.ResponseWriter, r *http.Request) error {
 	if !fc.purgeAllowed(r) {
+		w.Header().Set("Cache-Status", "fastcache; fwd=request; detail=purge-denied")
 		w.WriteHeader(http.StatusForbidden)
 
 		return nil
@@ -765,11 +860,17 @@ func (fc *FastCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 
+				name := d.Val()
+				vals := d.RemainingArgs()
+				if len(vals) == 0 {
+					return d.Errf("match_header %q requires at least one value", name)
+				}
+
 				if fc.MatchHeaders == nil {
 					fc.MatchHeaders = map[string][]string{}
 				}
 
-				fc.MatchHeaders[d.Val()] = append(fc.MatchHeaders[d.Val()], d.RemainingArgs()...)
+				fc.MatchHeaders[name] = append(fc.MatchHeaders[name], vals...)
 			case "vary":
 				fc.Vary = append(fc.Vary, d.RemainingArgs()...)
 			case "disable_touch_on_hit":
@@ -785,6 +886,11 @@ func (fc *FastCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				fc.PromoteBelow = d.Val()
+			case "revalidate_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				fc.RevalidateTimeout = d.Val()
 			default:
 				return d.Errf("unknown fastcache option %q", d.Val())
 			}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"sync"
 
 	"github.com/caddyserver/caddy/v2"
@@ -63,6 +64,7 @@ func listCacheKeys(w http.ResponseWriter, r *http.Request) error {
 	if keys == nil {
 		keys = []string{}
 	}
+	slices.Sort(keys)
 
 	w.Header().Set("Content-Type", "application/json")
 
@@ -80,7 +82,7 @@ func purgeCacheKeys(w http.ResponseWriter, r *http.Request) error {
 	var payload struct {
 		Pattern string `json:"pattern"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&payload); err != nil {
 		return caddy.APIError{HTTPStatus: http.StatusBadRequest, Err: err}
 	}
 

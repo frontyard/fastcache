@@ -2,7 +2,6 @@ package fastcache
 
 import (
 	"bufio"
-	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -43,6 +42,7 @@ type captureWriter struct {
 	failed   bool
 	wrote    bool   // headers/body already committed to the client
 	swallow  bool   // a stale fallback was served; drop upstream output
+	hijacked bool   // downstream was hijacked mid-capture; never commit
 	purgeAt  uint64 // purgeSeq snapshot at capture start; a bump aborts the commit
 
 	// fallback is a stale entry to serve when upstream fails (stale_if_error).
@@ -122,17 +122,8 @@ func (cw *captureWriter) decide(status int) {
 	}
 
 	// The upstream response is going to the client: move the buffered
-	// headers into the real writer. Connection-nominated fields and
-	// trailer-value keys are hop-by-hop — never forwarded nor stored.
-	connToks := connHeaderTokens(cw.hdr)
-	for k, vv := range cw.hdr {
-		ck := http.CanonicalHeaderKey(k)
-		if ck == "Connection" || connToks[ck] || strings.HasPrefix(k, http.TrailerPrefix) {
-			continue
-		}
-
-		cw.rw.Header()[k] = vv
-	}
+	// headers into the real writer, dropping hop-by-hop fields.
+	cw.forwardHeaders()
 
 	fresh, swr, varyH, mr, ok := responseCacheable(cw.ix, cw.req, status, cw.hdr)
 	if !ok || fresh <= 0 {
@@ -178,7 +169,7 @@ func (cw *captureWriter) decide(status int) {
 			return
 		}
 
-		f, err := os.OpenFile(cw.tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+		f, err := os.OpenFile(cw.tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
 		if err != nil {
 			cw.cacheable = false
 
@@ -219,6 +210,23 @@ func (cw *captureWriter) decide(status int) {
 	cw.missStatus()
 }
 
+// forwardHeaders copies the buffered upstream headers into the client
+// writer, dropping hop-by-hop fields: the static list, fields the response
+// nominates via Connection, and trailer-value keys (RFC 9110 §7.6.1).
+// Unlike cacheableHeaders it keeps Content-Length — the live response
+// forwards it intact; stored entries recompute it on serve.
+func (cw *captureWriter) forwardHeaders() {
+	connToks := connHeaderTokens(cw.hdr)
+	for k, vv := range cw.hdr {
+		ck := http.CanonicalHeaderKey(k)
+		if hopHeaders[ck] || connToks[ck] || strings.HasPrefix(k, http.TrailerPrefix) {
+			continue
+		}
+
+		cw.rw.Header()[k] = vv
+	}
+}
+
 // missStatus marks the response in Cache-Status (RFC 9211): uri-miss plus
 // "stored" and the cache key when the response will be committed.
 func (cw *captureWriter) missStatus() {
@@ -243,7 +251,7 @@ func (cw *captureWriter) WriteHeader(status int) {
 	if !cw.decided && status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
 		// Informational response — flush its headers downstream and keep
 		// buffering for the final WriteHeader.
-		maps.Copy(cw.rw.Header(), cw.hdr)
+		cw.forwardHeaders()
 		cw.rw.WriteHeader(status)
 
 		return
@@ -335,7 +343,7 @@ func (cw *captureWriter) Close(handlerErr error) {
 		_ = cw.tmp.Close()
 	}
 
-	if handlerErr != nil || cw.failed ||
+	if handlerErr != nil || cw.failed || cw.hijacked ||
 		(cw.declared >= 0 && cw.declared != cw.bodySize) ||
 		cw.req.Context().Err() != nil ||
 		cw.ix.purgeSeq.Load() != cw.purgeAt {
@@ -358,7 +366,7 @@ func (cw *captureWriter) Close(handlerErr error) {
 		}
 
 		// Meta sidecar goes in last — its presence marks a complete entry.
-		mf, err := os.OpenFile(cw.metaPath+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+		mf, err := os.OpenFile(cw.metaPath+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
 		if err != nil {
 			_ = os.Remove(cw.final)
 
@@ -398,6 +406,7 @@ func (cw *captureWriter) Close(handlerErr error) {
 		metaPath: cw.metaPath,
 		size:     cw.bodySize,
 		fileSize: fileSize,
+		purgeAt:  cw.purgeAt,
 		status:   cw.status,
 	}
 	e.headers.Store(&hdr)
@@ -441,7 +450,15 @@ func (cw *captureWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 		return nil, nil, http.ErrNotSupported
 	}
 
-	return h.Hijack()
+	c, rw, err := h.Hijack()
+	if err == nil {
+		// The handler took over the connection: whatever it writes now is
+		// invisible to us — an undeclared-length body could otherwise be
+		// committed truncated.
+		cw.hijacked = true
+	}
+
+	return c, rw, err
 }
 
 // Unwrap lets http.ResponseController reach the real writer (full-duplex

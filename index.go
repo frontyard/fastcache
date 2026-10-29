@@ -59,6 +59,7 @@ type entry struct {
 	metaPath       string // sidecar meta file
 	size           int64  // body size
 	fileSize       int64  // body + meta, for disk accounting
+	purgeAt        uint64 // purgeSeq snapshot at capture start; commit aborts if it moved
 	body           atomic.Pointer[[]byte]
 	headers        atomic.Pointer[http.Header]
 	storedAt       atomic.Int64
@@ -68,6 +69,7 @@ type entry struct {
 	status         int
 	seq            atomic.Uint64 // last-use UnixNano, coarse (see touchGranularity)
 	promoting      atomic.Bool   // a disk hit is currently loading the body into RAM
+	dropped        atomic.Bool   // files/accounting already released (dropFile is idempotent)
 }
 
 // meta serializes the entry's current state into a sidecar header.
@@ -266,8 +268,6 @@ func (ix *index) lookup(r *http.Request) (e *entry, stale, hit bool) {
 
 // commit installs a freshly stored variant.
 func (ix *index) commit(e *entry) {
-	ix.entries.Store(e.key, e)
-
 	ix.mappingMu.Lock()
 
 	var m *mapping
@@ -298,16 +298,35 @@ func (ix *index) commit(e *entry) {
 		}
 	}
 
+	// Variant set and entry slot publish under the same lock so two racing
+	// same-key commits can't leave them pointing at different entries.
 	prev, _ := m.variants.Swap(e.varyK, e)
+	ix.entries.Store(e.key, e)
 	ix.mappingMu.Unlock()
 
+	// prev was swapped out of the variant set and, sharing e.key, already
+	// overwritten in entries — nothing in the index can reach it, so drop
+	// its files and accounting directly. removeEntry's CAS would fail here:
+	// the entries slot holds the new entry, not prev.
 	if prev != nil && prev != e {
-		ix.removeEntry(prev.(*entry))
+		ix.dropFile(prev.(*entry))
 	}
 
 	ix.diskSize.Add(e.fileSize)
 	ix.fileCount.Add(1)
 	ix.scheduleExpiry(e)
+
+	// A purge or eviction that landed between the capture's start and this
+	// insert must not let the new entry resurrect just-removed content —
+	// re-verify before calling it committed. The dropFile covers the lost
+	// commit-race case too: our files are orphaned whichever way we lost.
+	if v, ok := ix.entries.Load(e.key); !ok || v != e || ix.purgeSeq.Load() != e.purgeAt {
+		ix.deleteEntry(e)
+		ix.dropFile(e)
+
+		return
+	}
+
 	ix.maybeEvict()
 }
 
@@ -331,7 +350,9 @@ func (ix *index) deleteEntry(e *entry) bool {
 		m.variants.Range(func(_, _ any) bool { empty = false; return false })
 
 		if empty {
-			ix.mappings.Delete(e.baseKey)
+			// CAS on the pointer: a different mapping (vary-change) or one
+			// that gained a variant between the Range and here must survive.
+			ix.mappings.CompareAndDelete(e.baseKey, m)
 		}
 	}
 	ix.mappingMu.Unlock()
@@ -351,6 +372,10 @@ func (ix *index) removeEntry(e *entry) {
 }
 
 func (ix *index) dropFile(e *entry) {
+	if !e.dropped.CompareAndSwap(false, true) {
+		return
+	}
+
 	ix.diskSize.Add(-e.fileSize)
 	ix.fileCount.Add(-1)
 
@@ -675,6 +700,17 @@ func writeMeta(w io.Writer, m *metaHeader) (int64, error) {
 
 // readMeta parses a meta sidecar.
 func readMeta(path string) (*metaHeader, int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// A sidecar is magic + 4-byte length + a gob payload capped at 1 MiB —
+	// reject oversized files by stat so they are never read into memory.
+	if info.Size() < 8 || info.Size() > 8+(1<<20) {
+		return nil, 0, fmt.Errorf("implausible meta size %d", info.Size())
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, 0, err
@@ -699,7 +735,10 @@ func readMeta(path string) (*metaHeader, int64, error) {
 
 // rebuild scans the storage tree — bodies and meta sidecars live in 256
 // shard directories under dir — and repopulates the index from meta
-// sidecars. Expired, malformed, or orphaned files are removed.
+// sidecars. Expired, malformed, or orphaned files are removed. Files
+// outside <2hex> shard directories are never indexed nor reaped: path may
+// be misconfigured to a shared directory, and a foreign file named like a
+// cache file must survive.
 func (ix *index) rebuild() error {
 	var metas, allFiles, dirs []string
 
@@ -708,9 +747,21 @@ func (ix *index) rebuild() error {
 			return nil
 		}
 		if d.IsDir() {
-			if p != ix.dir {
-				dirs = append(dirs, p)
+			if p == ix.dir {
+				return nil
 			}
+			// Non-shard subdirectories are foreign — skip their subtree so
+			// their contents are neither indexed nor reaped.
+			if filepath.Dir(p) == ix.dir && !shardDirRe.MatchString(d.Name()) {
+				return fs.SkipDir
+			}
+			dirs = append(dirs, p)
+
+			return nil
+		}
+		// Only files directly inside a shard directory are fastcache's.
+		parent := filepath.Dir(p)
+		if filepath.Dir(parent) != ix.dir || !shardDirRe.MatchString(filepath.Base(parent)) {
 			return nil
 		}
 		allFiles = append(allFiles, p)
@@ -725,6 +776,7 @@ func (ix *index) rebuild() error {
 
 	now := time.Now().UnixNano()
 	tracked := map[string]struct{}{}
+	seen := map[string]struct{}{}
 
 	for _, metaPath := range metas {
 		// RAM-only mode loads nothing; the orphan pass below removes any
@@ -761,6 +813,13 @@ func (ix *index) rebuild() error {
 			fullKey = m.Key + "|v|" + m.VaryKey
 		}
 
+		if _, dup := seen[fullKey]; dup {
+			// Two metas resolve to one index key (e.g. files a replaced
+			// variant left behind): first wins, the rest is orphaned below.
+			continue
+		}
+		seen[fullKey] = struct{}{}
+
 		hdr := http.Header(m.Headers)
 		e := &entry{
 			key:      fullKey,
@@ -784,17 +843,27 @@ func (ix *index) rebuild() error {
 		ix.diskSize.Add(e.fileSize)
 		ix.fileCount.Add(1)
 		ix.scheduleExpiry(e)
-		tracked[metaPath] = struct{}{}
-		tracked[bodyPath] = struct{}{}
 
+		// mapping.varyHeaders is immutable once published (lock-free readers
+		// depend on it): the first-loaded scheme wins, and a meta that
+		// disagrees is unreachable — drop it instead of mutating the mapping.
 		ix.mappingMu.Lock()
 		v, _ := ix.mappings.LoadOrStore(m.Key, &mapping{varyHeaders: m.VaryHeaders})
 		mp := v.(*mapping)
-		if len(m.VaryHeaders) > 0 && len(mp.varyHeaders) == 0 {
-			mp.varyHeaders = m.VaryHeaders
+		sameScheme := slices.Equal(mp.varyHeaders, m.VaryHeaders)
+		if sameScheme {
+			mp.variants.Store(m.VaryKey, e)
 		}
-		mp.variants.Store(m.VaryKey, e)
 		ix.mappingMu.Unlock()
+
+		if !sameScheme {
+			ix.removeEntry(e)
+
+			continue
+		}
+
+		tracked[metaPath] = struct{}{}
+		tracked[bodyPath] = struct{}{}
 	}
 
 	// Remove unreferenced fastcache files, then the now empty shard
@@ -806,7 +875,7 @@ func (ix *index) rebuild() error {
 		}
 	}
 	for _, d := range dirs {
-		if shardDirRe.MatchString(filepath.Base(d)) {
+		if filepath.Dir(d) == ix.dir && shardDirRe.MatchString(filepath.Base(d)) {
 			_ = os.Remove(d)
 		}
 	}
@@ -839,26 +908,27 @@ func (ix *index) refresh304(e *entry, h http.Header) {
 	e.expiresAt.Store(now.Add(fresh).UnixNano())
 	e.staleAt.Store(now.Add(fresh + max(ix.swr, ix.sie)).UnixNano())
 
-	cc := responseCC(merged)
-	_, mr := cc["must-revalidate"]
-	if _, ok := cc["proxy-revalidate"]; ok {
-		mr = true
-	}
-	e.mustRevalidate.Store(mr)
+	e.mustRevalidate.Store(mustRevalidate(responseCC(merged)))
 
 	ix.scheduleExpiry(e)
 	ix.persistMeta(e)
 }
 
 // persistMeta rewrites an entry's meta sidecar after an in-place update.
-// No-op for RAM-only entries.
+// No-op for RAM-only entries, and skipped when the entry has meanwhile
+// been purged or evicted — writing it back would resurrect an orphan
+// sidecar (rebuild would reap it, but not until the next restart).
 func (ix *index) persistMeta(e *entry) {
 	if ix.ramOnly || e.metaPath == "" {
 		return
 	}
 
+	if v, ok := ix.entries.Load(e.key); !ok || v != e {
+		return
+	}
+
 	tmp := e.metaPath + ".tmp"
-	mf, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	mf, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
 	if err != nil {
 		return
 	}
@@ -871,7 +941,15 @@ func (ix *index) persistMeta(e *entry) {
 		return
 	}
 
-	_ = os.Rename(tmp, e.metaPath)
+	if err := os.Rename(tmp, e.metaPath); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+
+	// Lost a delete race between the check and the rename: take it down.
+	if v, ok := ix.entries.Load(e.key); !ok || v != e {
+		_ = os.Remove(e.metaPath)
+	}
 }
 
 // purge removes the whole variant set for a base key; reason feeds the
