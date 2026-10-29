@@ -6,6 +6,7 @@ require (
 	github.com/caddyserver/caddy/v2 v2.11.7
 	github.com/dustin/go-humanize v1.1.0
 	github.com/prometheus/client_golang v1.24.1
+	go.uber.org/zap v1.28.0
 )
 
 require (
@@ -130,7 +131,6 @@ require (
 	go.step.sm/crypto v0.91.0 // indirect
 	go.uber.org/automaxprocs v1.6.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.28.0 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect

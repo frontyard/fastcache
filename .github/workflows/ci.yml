@@ -74,9 +74,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Scan with the latest stable toolchain, not the go.mod minimum:
+      # stdlib vulnerabilities patched in newer point releases otherwise
+      # fail the job even though they aren't this module's code.
       - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version: stable
           cache: true
 
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
