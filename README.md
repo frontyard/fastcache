@@ -34,6 +34,46 @@ gap is per-hit middleware machinery, and the souin `Storer` interface returns
 path instead: lock-free hits, RAM-resident bodies, disk bodies served through
 `ServeContent`/`io.Copy` on a real file.
 
+## Building Caddy with fastcache
+
+Caddy plugins compile into the binary — there is no dynamic loading. Use
+[`xcaddy`](https://github.com/caddyserver/xcaddy), which writes a `main` that
+imports the plugin and runs `go build` (Go ≥ the version in `go.mod`
+required):
+
+```sh
+go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+# tagged release / module path
+xcaddy build --with github.com/frontyard/fastcache
+
+# or from a local checkout (same syntax a go.mod replace uses)
+xcaddy build --with github.com/frontyard/fastcache=/path/to/fastcache
+```
+
+This produces a `./caddy` binary. Verify the module and the admin API are in:
+
+```sh
+./caddy list-modules | grep fastcache
+#   http.handlers.fastcache
+#   admin.api.fastcache
+```
+
+The module self-registers via `init()` — nothing else is needed in the
+binary. For the JSON config (no Caddyfile), the handler module ID is
+`http.handlers.fastcache` inside an app's `routes`/`handle` chain; the
+`fastcache` directive maps onto it.
+
+Docker: the official builder image already ships Go + xcaddy:
+
+```dockerfile
+FROM caddy:builder AS builder
+RUN xcaddy build --with github.com/frontyard/fastcache
+
+FROM caddy
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+```
+
 ## Usage
 
 ```caddyfile
