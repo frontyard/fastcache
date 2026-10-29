@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -2258,6 +2260,7 @@ func TestProvisionBadConfig(t *testing.T) {
 		{"bad ttl", func(fc *FastCache) { fc.TTL = "tomorrow" }},
 		{"bad swr", func(fc *FastCache) { fc.StaleWhileRevalidate = "soon" }},
 		{"bad sie", func(fc *FastCache) { fc.StaleIfError = "eventually" }},
+		{"bad revalidate_timeout", func(fc *FastCache) { fc.RevalidateTimeout = "later" }},
 		{"bad purge_allow", func(fc *FastCache) { fc.PurgeAllow = []string{"not-an-ip"} }},
 		{"bad promote_below", func(fc *FastCache) { fc.PromoteBelow = "lots" }},
 		{"negative memory_size", func(fc *FastCache) { fc.MemorySize = "-1" }},
@@ -2265,6 +2268,7 @@ func TestProvisionBadConfig(t *testing.T) {
 		{"negative ttl", func(fc *FastCache) { fc.TTL = "-1h" }},
 		{"negative swr", func(fc *FastCache) { fc.StaleWhileRevalidate = "-5s" }},
 		{"negative sie", func(fc *FastCache) { fc.StaleIfError = "-5s" }},
+		{"negative revalidate_timeout", func(fc *FastCache) { fc.RevalidateTimeout = "-5s" }},
 		{"negative max_items", func(fc *FastCache) { fc.MaxItems = -5 }},
 		{"negative promote_below", func(fc *FastCache) { fc.PromoteBelow = "-1" }},
 	} {
@@ -3250,5 +3254,481 @@ func TestRevalidateTimeoutOption(t *testing.T) {
 	}
 	if fc.RevalidateTimeout != "45s" {
 		t.Fatalf("revalidate_timeout = %q", fc.RevalidateTimeout)
+	}
+}
+
+// TestStatusRW: the unsafe-method wrapper records the first status only and
+// forwards the full ResponseWriter interface (Flush, ReadFrom, Hijack,
+// Unwrap) so bypassed upstream handlers behave normally.
+func TestStatusRW(t *testing.T) {
+	rec := httptest.NewRecorder()
+	sw := &statusRW{ResponseWriter: rec}
+
+	sw.WriteHeader(http.StatusCreated)
+	sw.WriteHeader(http.StatusTeapot) // second call: status must not flip
+	if sw.status != http.StatusCreated {
+		t.Fatalf("status flipped to %d", sw.status)
+	}
+
+	// Write without an explicit WriteHeader commits 200.
+	sw2 := &statusRW{ResponseWriter: httptest.NewRecorder()}
+	_, _ = sw2.Write([]byte("x"))
+	if sw2.status != http.StatusOK || !sw2.wrote {
+		t.Fatal("Write did not commit an implicit 200")
+	}
+
+	// Flush commits 200 and reaches the wrapped flusher.
+	sw3 := &statusRW{ResponseWriter: httptest.NewRecorder()}
+	sw3.Flush()
+	if sw3.status != http.StatusOK {
+		t.Fatal("Flush did not commit 200")
+	}
+
+	// ReadFrom: io.Copy picks it up (a LimitReader hides WriterTo so the
+	// destination's ReadFrom is what runs); it must delegate to a wrapped
+	// ReaderFrom (sendfile) when there is one.
+	sw4 := &statusRW{ResponseWriter: httptest.NewRecorder()}
+	n, err := io.Copy(sw4, io.LimitReader(strings.NewReader("body"), 4))
+	if err != nil || n != 4 {
+		t.Fatalf("ReadFrom fallback: %d %v", n, err)
+	}
+
+	rf := &readerFromRW{ResponseWriter: httptest.NewRecorder()}
+	sw5 := &statusRW{ResponseWriter: rf}
+	_, _ = io.Copy(sw5, io.LimitReader(strings.NewReader("body"), 4))
+	if !rf.used {
+		t.Fatal("ReadFrom did not reach the wrapped ReaderFrom")
+	}
+
+	// Hijack and Unwrap.
+	if _, _, err := sw.Hijack(); !errors.Is(err, http.ErrNotSupported) {
+		t.Fatalf("expected ErrNotSupported, got %v", err)
+	}
+
+	server, _ := net.Pipe()
+	defer func() { _ = server.Close() }()
+	sw6 := &statusRW{ResponseWriter: &hijackRW{ResponseWriter: httptest.NewRecorder(), c: server}}
+	if _, _, err := sw6.Hijack(); err != nil {
+		t.Fatalf("hijack passthrough: %v", err)
+	}
+
+	if sw.Unwrap() != rec {
+		t.Fatal("Unwrap did not return the embedded writer")
+	}
+}
+
+// readerFromRW implements io.ReaderFrom so statusRW.ReadFrom delegation can
+// be observed.
+type readerFromRW struct {
+	http.ResponseWriter
+	used bool
+}
+
+func (w *readerFromRW) ReadFrom(src io.Reader) (int64, error) {
+	w.used = true
+	return io.Copy(w.ResponseWriter, src)
+}
+
+// TestDiscardRW: the refresh-time discard writer swallows everything —
+// its Header map is the only reachable surface.
+func TestDiscardRW(t *testing.T) {
+	d := &discardRW{h: http.Header{}}
+	d.Header().Set("X", "y")
+	d.WriteHeader(http.StatusTeapot)
+
+	if n, err := d.Write([]byte("abc")); err != nil || n != 3 {
+		t.Fatalf("discard Write: %d %v", n, err)
+	}
+	if d.Header().Get("X") != "y" {
+		t.Fatal("discard Header lost a value")
+	}
+}
+
+// TestParseFastCache: the httpcaddyfile adapter wraps the same Unmarshal.
+func TestParseFastCache(t *testing.T) {
+	d := caddyfile.NewTestDispenser("fastcache {\n\tmemory_size 8MB\n}")
+
+	h, err := parseFastCache(httpcaddyfile.Helper{Dispenser: d})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if fc, ok := h.(*FastCache); !ok || fc.MemorySize != "8MB" {
+		t.Fatalf("parseFastCache returned %+v", h)
+	}
+
+	// Adapter errors surface, not panic.
+	bad := caddyfile.NewTestDispenser("fastcache {\n\tbogus_opt x\n}")
+	if _, err := parseFastCache(httpcaddyfile.Helper{Dispenser: bad}); err == nil {
+		t.Fatal("expected parse error for bad option")
+	}
+}
+
+// TestAdminRoutes: the admin module exposes the keys and purge routes.
+func TestAdminRoutes(t *testing.T) {
+	routes := adminAPI{}.Routes()
+	if len(routes) != 2 || routes[0].Pattern != "/fastcache/keys" || routes[1].Pattern != "/fastcache/purge" {
+		t.Fatalf("unexpected routes: %+v", routes)
+	}
+}
+
+// TestAdminPurgeBodyLimit: the purge endpoint refuses bodies beyond the
+// 1 MiB cap instead of buffering them into memory.
+func TestAdminPurgeBodyLimit(t *testing.T) {
+	body := strings.NewReader(`{"pattern":"` + strings.Repeat("a", 1<<20) + `"}`)
+	w := httptest.NewRecorder()
+
+	var apiErr caddy.APIError
+	if err := purgeCacheKeys(w, httptest.NewRequest(http.MethodDelete, "/fastcache/purge", body)); !errors.As(err, &apiErr) || apiErr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("expected 400 for oversized body, got %v", err)
+	}
+}
+
+// TestAdminKeysSorted: the keys listing is deterministic.
+func TestAdminKeysSorted(t *testing.T) {
+	fc := newTestCache(t, nil)
+	liveCaches.Store(fc, struct{}{})
+	t.Cleanup(func() { liveCaches.Delete(fc) })
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, []byte("x"), http.Header{"Cache-Control": {"public, max-age=3600"}})
+
+	get(t, fc, "/z", nil, next)
+	get(t, fc, "/a", nil, next)
+	get(t, fc, "/m", nil, next)
+
+	w := httptest.NewRecorder()
+	if err := listCacheKeys(w, httptest.NewRequest(http.MethodGet, "/fastcache/keys", nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	var listing struct {
+		Keys []string `json:"keys"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &listing); err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.IsSorted(listing.Keys) || len(listing.Keys) != 3 {
+		t.Fatalf("keys not sorted: %v", listing.Keys)
+	}
+}
+
+// TestVarySchemeChange: when upstream starts answering with a different
+// whitelisted Vary list, the old variant set is unreachable — commit drops
+// the whole mapping and rebuilds it under the new scheme.
+func TestVarySchemeChange(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.Vary = []string{"X-A", "X-B"} })
+
+	var calls atomic.Int64
+	varyBy := "X-A"
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Vary", varyBy)
+		_, _ = w.Write([]byte("x"))
+
+		return nil
+	})
+
+	h1 := http.Header{"X-A": {"1"}, "X-B": {"1"}}
+	h2 := http.Header{"X-A": {"2"}, "X-B": {"2"}}
+
+	get(t, fc, "/", h1, next) // scheme [X-A]
+	varyBy = "X-B"
+	get(t, fc, "/", h2, next) // scheme change → mapping dropped, rebuilt [X-B]
+
+	if got := fc.idx.fileCount.Load(); got != 1 {
+		t.Fatalf("old variant should be dropped, fileCount=%d", got)
+	}
+
+	// A request under the old scheme now misses — it computes a different
+	// varyKey under [X-B].
+	get(t, fc, "/", h1, next)
+	if calls.Load() != 3 {
+		t.Fatalf("expected 3 upstream calls, got %d", calls.Load())
+	}
+}
+
+// TestReadMetaErrors: every malformed sidecar shape is rejected before it
+// can reach the gob decoder.
+func TestReadMetaErrors(t *testing.T) {
+	dir := t.TempDir()
+	put := func(name string, data []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, data, 0o640); err != nil {
+			t.Fatal(err)
+		}
+
+		return p
+	}
+
+	magic := make([]byte, 4)
+	copy(magic, fileMagic)
+
+	mk := func(metaLen uint32, payload []byte) []byte {
+		b := append(append([]byte{}, magic...), byte(metaLen>>24), byte(metaLen>>16), byte(metaLen>>8), byte(metaLen))
+		return append(b, payload...)
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"missing", filepath.Join(dir, "nope")},
+		{"tiny", put("tiny", []byte("x"))},
+		{"bad magic", put("badmagic", append([]byte("ZZZZ"), 0, 0, 0, 1, 0))},
+		{"declared over cap", put("cap", mk(2<<20, nil))},
+		{"short payload", put("short", mk(64, []byte("ab")))},
+		{"empty gob", put("empty", mk(0, nil))},
+		{"bad gob", put("badgob", mk(10, []byte("not-a-gob!")))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := readMeta(tc.path); err == nil {
+				t.Fatal("expected readMeta error")
+			}
+		})
+	}
+
+	// Roundtrip: writeMeta's output parses back to the same record.
+	var buf bytes.Buffer
+	want := &metaHeader{Key: "example.com/x", Status: 200, StoredAt: 7, Headers: map[string][]string{"A": {"1"}}}
+	if _, err := writeMeta(&buf, want); err != nil {
+		t.Fatal(err)
+	}
+
+	p := put("ok", buf.Bytes())
+	got, _, err := readMeta(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Key != want.Key || got.Status != want.Status || got.Headers["A"][0] != "1" {
+		t.Fatalf("meta roundtrip mismatch: %+v", got)
+	}
+}
+
+// TestPersistMetaSkips: persistMeta bails out on RAM-only entries,
+// meta-less entries, and entries that left the index — never resurrecting
+// a sidecar for deleted content.
+func TestPersistMetaSkips(t *testing.T) {
+	dir := t.TempDir()
+
+	ram := &FastCache{Path: dir, MemorySize: "64MB", DiskSize: "0", TTL: "1h"}
+	ram.memoryBytes, _ = parseSize(ram.MemorySize, 0)
+	ram.diskBytes, _ = parseSize(ram.DiskSize, 0)
+	ramIx := newIndex(ram)
+	ramIx.persistMeta(&entry{key: "k", metaPath: filepath.Join(dir, "ab", "gone.meta")})
+
+	disk := &FastCache{Path: dir, MemorySize: "64MB", DiskSize: "1GB", TTL: "1h"}
+	disk.memoryBytes, _ = parseSize(disk.MemorySize, 0)
+	disk.diskBytes, _ = parseSize(disk.DiskSize, 0)
+	ix := newIndex(disk)
+
+	// No metaPath — nothing to write.
+	ix.persistMeta(&entry{key: "k"})
+
+	// Not in the index — the write would resurrect a dead entry.
+	ghost := &entry{key: "k", metaPath: filepath.Join(dir, "ab", "ghost.meta")}
+	ix.persistMeta(ghost)
+	if _, err := os.Stat(ghost.metaPath); !os.IsNotExist(err) {
+		t.Fatal("persistMeta wrote a meta for an unindexed entry")
+	}
+
+	// Live entry — the meta lands.
+	shard := filepath.Join(dir, "ab")
+	if err := os.MkdirAll(shard, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	live := &entry{key: "k", baseKey: "k", metaPath: filepath.Join(shard, "live.meta"), status: 200}
+	hdr := http.Header{"A": {"1"}}
+	live.headers.Store(&hdr)
+	live.storedAt.Store(time.Now().UnixNano())
+	live.expiresAt.Store(time.Now().Add(time.Hour).UnixNano())
+	ix.entries.Store("k", live)
+	ix.persistMeta(live)
+
+	if _, err := os.Stat(live.metaPath); err != nil {
+		t.Fatalf("persistMeta did not write live meta: %v", err)
+	}
+}
+
+// TestPurgeDuringCapture: a PURGE landing while the upstream response is
+// still streaming must abort the commit — purged content can never be
+// resurrected by a racing store.
+func TestPurgeDuringCapture(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.WriteHeader(http.StatusOK)
+		if n == 1 {
+			close(started)
+			<-release
+		}
+		_, _ = w.Write([]byte("x"))
+
+		return nil
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = fc.ServeHTTP(httptest.NewRecorder(), r, next)
+	}()
+
+	<-started
+	fc.idx.purge(fc.idx.baseKey(r), "purge")
+	close(release)
+	<-done
+
+	if _, _, ok := fc.idx.lookup(r); ok {
+		t.Fatal("capture committed over a purge")
+	}
+
+	get(t, fc, "/", nil, next)
+	if calls.Load() != 2 {
+		t.Fatalf("expected a fresh upstream call after aborted commit, got %d", calls.Load())
+	}
+}
+
+// TestLastModified: lastModified parses the stored field or yields the
+// zero time (which ServeContent treats as "no timestamp").
+func TestLastModified(t *testing.T) {
+	e := &entry{}
+
+	hdr := http.Header{}
+	e.headers.Store(&hdr)
+	if got := lastModified(e); !got.IsZero() {
+		t.Fatalf("no Last-Modified: got %v", got)
+	}
+
+	hdr["Last-Modified"] = []string{"not a date"}
+	if got := lastModified(e); !got.IsZero() {
+		t.Fatalf("bad Last-Modified: got %v", got)
+	}
+
+	hdr["Last-Modified"] = []string{"Mon, 02 Jan 2006 15:04:05 GMT"}
+	if got := lastModified(e); got.IsZero() || got.Year() != 2006 {
+		t.Fatalf("valid Last-Modified: got %v", got)
+	}
+}
+
+// TestMetricsRegisterReuse: a second cacheMetrics into one registry reuses
+// the first's collectors — counters aggregate across instances.
+func TestMetricsRegisterReuse(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	m1 := newCacheMetrics()
+	m1.register(reg)
+
+	m2 := newCacheMetrics()
+	m2.register(reg)
+
+	if m1.requests != m2.requests || m1.evictions != m2.evictions {
+		t.Fatal("second instance did not reuse the registered collectors")
+	}
+
+	m1.req("hit")
+	m2.req("hit")
+
+	got, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var found float64
+	for _, mf := range got {
+		if mf.GetName() != "fastcache_requests_total" {
+			continue
+		}
+		for _, c := range mf.GetMetric() {
+			if c.GetLabel()[0].GetValue() == "hit" {
+				found = c.GetCounter().GetValue()
+			}
+		}
+	}
+
+	if found != 2 {
+		t.Fatalf("counters should aggregate across instances, got %v", found)
+	}
+
+	// sumIndexes sees live instances and skips ones with a nil index.
+	fc := newTestCache(t, nil)
+	liveCaches.Store(fc, struct{}{})
+	liveCaches.Store(&FastCache{}, struct{}{}) // never provisioned
+	defer liveCaches.Delete(fc)
+
+	if total := sumIndexes(func(ix *index) int64 { return ix.fileCount.Load() }); total != 0 {
+		t.Fatalf("sumIndexes = %d, want 0", total)
+	}
+}
+
+// TestFreshnessTable: every freshness source, in precedence order.
+func TestFreshnessTable(t *testing.T) {
+	fc := &FastCache{Path: t.TempDir()}
+	fc.ttl = time.Hour
+	ix := newIndex(fc)
+
+	past := time.Now().Add(-100 * time.Second).UTC().Format(http.TimeFormat)
+	future := time.Now().Add(10 * time.Second).UTC().Format(http.TimeFormat)
+
+	for _, tc := range []struct {
+		name string
+		h    http.Header
+		want time.Duration
+	}{
+		{"default", http.Header{}, time.Hour},
+		{"max-age", http.Header{"Cache-Control": {"public, max-age=60"}}, 60 * time.Second},
+		{"s-maxage wins", http.Header{"Cache-Control": {"public, s-maxage=30, max-age=60"}}, 30 * time.Second},
+		{"no-cache", http.Header{"Cache-Control": {"public, no-cache"}}, 0},
+		{"max-age zero", http.Header{"Cache-Control": {"public, max-age=0"}}, 0},
+		{"expires future", http.Header{"Expires": {future}}, 10 * time.Second},
+		{"expires past", http.Header{"Expires": {past}}, 0},
+		{"expires garbage", http.Header{"Expires": {"junk"}}, time.Hour},
+		{"last-modified heuristic", http.Header{"Last-Modified": {past}}, -1},
+		{"last-modified future", http.Header{"Last-Modified": {future}}, time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := freshness(ix, tc.h)
+			if tc.want < 0 {
+				// ~age/10 with real elapsed time — assert the neighborhood.
+				if got < 9*time.Second || got > 11*time.Second {
+					t.Fatalf("freshness = %v, want ~10s", got)
+				}
+				return
+			}
+			if tc.name == "expires future" {
+				if got <= 0 || got > 10*time.Second {
+					t.Fatalf("freshness = %v", got)
+				}
+				return
+			}
+			if got != tc.want {
+				t.Fatalf("freshness = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUnmarshalCaddyfileMissingArgs: single-value options must reject a
+// bare keyword instead of silently keeping defaults.
+func TestUnmarshalCaddyfileMissingArgs(t *testing.T) {
+	for _, opt := range []string{
+		"path", "memory_size", "disk_size", "max_items", "ttl",
+		"stale_while_revalidate", "stale_if_error", "cache_key",
+		"promote_below", "revalidate_timeout",
+	} {
+		t.Run(opt, func(t *testing.T) {
+			var fc FastCache
+			err := fc.UnmarshalCaddyfile(caddyfile.NewTestDispenser("fastcache {\n\t" + opt + "\n}"))
+			if err == nil {
+				t.Fatalf("%s with no argument should be an error", opt)
+			}
+		})
 	}
 }

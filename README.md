@@ -439,7 +439,7 @@ shared-zone bookkeeping nginx pays per request.
 
 ```sh
 go build ./...            # module name is `fastcache`; rename to a domain path before publishing
-go test -race -count=1    # 86 tests, ~87% statement coverage, including concurrency-churn under -race
+go test -race -count=1    # ~100 tests, ~92% statement coverage, including concurrency-churn under -race
 bash bench/run.sh         # end-to-end bench (see bench/README below)
 ```
 
