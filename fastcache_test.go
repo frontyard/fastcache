@@ -1008,6 +1008,80 @@ func TestStaleWhileRevalidate(t *testing.T) {
 	})
 }
 
+// TestRefreshVarsIsolation: the request-scoped vars map must not be
+// shared with the background SWR fetch. Handlers downstream write to it
+// (reverse_proxy calls SetVar on every proxied request) while the
+// caller's request is still being read — access logging calls GetVar on
+// every request — which in production is a fatal "concurrent map read
+// and map write". The final assertion fails deterministically if the
+// background write leaks into the caller's map; under -race, the read
+// loop reports the overlap.
+func TestRefreshVarsIsolation(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.StaleWhileRevalidate = "5s" })
+
+	varsReq := func(t *testing.T, next caddyhttp.Handler) (*http.Request, *httptest.ResponseRecorder) {
+		t.Helper()
+
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, map[string]any{
+			caddyhttp.ClientIPVarKey: "1.2.3.4",
+		})
+		r = r.WithContext(ctx)
+
+		w := httptest.NewRecorder()
+		if err := fc.ServeHTTP(w, r, next); err != nil {
+			t.Fatalf("ServeHTTP: %v", err)
+		}
+
+		return r, w
+	}
+
+	ok := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		w.Header().Set("Cache-Control", "public, max-age=1")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("v1"))
+
+		return nil
+	})
+	varsReq(t, ok)
+
+	time.Sleep(1100 * time.Millisecond)
+
+	// Stale and inside the SWR window: the caller gets the old body while
+	// refresh() re-fetches in a goroutine. The write mirrors what
+	// reverse_proxy does to every request it proxies.
+	release := make(chan struct{})
+	writing := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		caddyhttp.SetVar(r.Context(), "bg_write", "1")
+		<-release
+
+		w.Header().Set("Cache-Control", "public, max-age=1")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("v2"))
+
+		return nil
+	})
+	r2, w2 := varsReq(t, writing)
+	if w2.Body.String() != "v1" {
+		t.Fatalf("expected stale body, got %q", w2.Body.String())
+	}
+
+	// While the background write is in flight, hammer reads on the
+	// caller's map — what access logging does at request end.
+	for i := 0; i < 1e5; i++ {
+		_ = caddyhttp.GetVar(r2.Context(), caddyhttp.ClientIPVarKey)
+	}
+	close(release)
+
+	waitFor(t, "background revalidation to commit v2", func() bool {
+		return get(t, fc, "/", nil, ok).Body.String() == "v2"
+	})
+
+	if v := caddyhttp.GetVar(r2.Context(), "bg_write"); v != nil {
+		t.Fatalf("background SetVar leaked into caller's vars map: %v", v)
+	}
+}
+
 // TestOrphanTmpFiles verifies .tmp files from crashed stores get cleaned by
 // rebuild (they lack the magic header).
 func TestOrphanTmpFiles(t *testing.T) {
