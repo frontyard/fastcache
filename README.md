@@ -110,6 +110,7 @@ into the cache while streaming it to the client.
 | `ttl`                         | `1h`                   | Fallback freshness when the response carries no `max-age`/`s-maxage`/`Expires`                                                                                                           |
 | `stale_while_revalidate`      | `0` (off)              | Serve an expired entry while one background refresh runs                                                                                                                                 |
 | `stale_if_error`              | `0` (off)              | Retain expired entries this long as upstream-failure fallback (see below)                                                                                                                |
+| `status_ttl`                  | none                   | Per-status freshness cap: `status_ttl <code>... <duration>` (repeatable); bounds even explicit upstream freshness — `0` disables storing that status                                   |
 | `revalidate_timeout`          | `30s`                  | Bound on any single upstream revalidation (`0` = unbounded)                                                                                                                              |
 | `cache_key`                   | `{host}{requestURI}`   | Cache key as a caddy placeholder template, e.g. `{http.request.host}{http.request.uri.path}`                                                                                             |
 | `match_header`                | none                   | Store only responses whose header `<name>` equals one of the given values (repeatable)                                                                                                   |
@@ -254,6 +255,12 @@ retention window: an entry lives until `expiry + max(swr, sie)`.
   `Expires` → `Last-Modified` heuristic (10% of object age, capped at `ttl`)
   → configured `ttl`. An upstream `Age` header is folded into the stored
   timestamps, so freshness is not overextended.
+- **status_ttl** caps that freshness per status code — a hard ceiling, so
+  unlike nginx `proxy_cache_valid` it bounds even explicit upstream
+  `max-age`/`Expires` (e.g. an error page stamped `Cache-Control: public`).
+  A `0` cap makes the status unstorable; unlisted statuses are unaffected.
+  Entries shortened this way keep the usual stale window
+  (`expiry + max(swr, sie)`).
 - **match_header** rules gate storage on *response* headers — `match_header
   Content-Type image/png image/jpeg` caches only those content types. At
   least one value is required. (Request-side matching — paths, methods —

@@ -44,6 +44,7 @@ type FastCache struct {
 	TTL                  string              `json:"ttl,omitempty"`
 	StaleWhileRevalidate string              `json:"stale_while_revalidate,omitempty"`
 	StaleIfError         string              `json:"stale_if_error,omitempty"`
+	StatusTTL            map[int]string      `json:"status_ttl,omitempty"`
 	CacheKey             string              `json:"cache_key,omitempty"`
 	MatchHeaders         map[string][]string `json:"match_headers,omitempty"`
 	Vary                 []string            `json:"vary,omitempty"`
@@ -60,6 +61,7 @@ type FastCache struct {
 	ttl               time.Duration
 	swr               time.Duration
 	sie               time.Duration
+	statusTTL         map[int]time.Duration
 	revalidateTimeout time.Duration
 	purgeNets         []netip.Prefix
 
@@ -108,6 +110,10 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 
 	if fc.sie, err = parseDuration(fc.StaleIfError, 0); err != nil {
 		return fmt.Errorf("stale_if_error: %w", err)
+	}
+
+	if fc.statusTTL, err = parseStatusTTLs(fc.StatusTTL); err != nil {
+		return fmt.Errorf("status_ttl: %w", err)
 	}
 
 	if fc.revalidateTimeout, err = parseDuration(fc.RevalidateTimeout, 30*time.Second); err != nil {
@@ -204,6 +210,28 @@ func parseDuration(v string, def time.Duration) (time.Duration, error) {
 	}
 
 	return time.ParseDuration(v)
+}
+
+// parseStatusTTLs converts the configured status→duration-string map into
+// parsed durations, rejecting negative caps.
+func parseStatusTTLs(m map[int]string) (map[int]time.Duration, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+
+	out := make(map[int]time.Duration, len(m))
+	for code, s := range m {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return nil, fmt.Errorf("status %d: %w", code, err)
+		}
+		if d < 0 {
+			return nil, fmt.Errorf("status %d: duration must be >= 0, got %s", code, s)
+		}
+		out[code] = d
+	}
+
+	return out, nil
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
@@ -904,6 +932,24 @@ func (fc *FastCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 
 				fc.StaleIfError = d.Val()
+			case "status_ttl":
+				args := d.RemainingArgs()
+				if len(args) < 2 {
+					return d.Errf("status_ttl requires at least one status code and a duration")
+				}
+
+				if fc.StatusTTL == nil {
+					fc.StatusTTL = map[int]string{}
+				}
+
+				for _, s := range args[:len(args)-1] {
+					code, err := strconv.Atoi(s)
+					if err != nil || code < 100 || code > 599 {
+						return d.Errf("status_ttl: invalid status code %q", s)
+					}
+
+					fc.StatusTTL[code] = args[len(args)-1]
+				}
 			case "cache_key":
 				if !d.NextArg() {
 					return d.ArgErr()

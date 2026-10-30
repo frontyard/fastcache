@@ -161,9 +161,25 @@ func responseCacheable(ix *index, r *http.Request, status int, h http.Header) (f
 	// look like a scheme change.
 	varyHeaders = slices.Compact(slices.Sorted(slices.Values(varyHeaders)))
 
-	fresh = freshness(ix, h)
+	fresh = statusCap(ix, status, freshness(ix, h))
 
 	return fresh, ix.swr, varyHeaders, mr, true
+}
+
+// statusCap applies the per-status freshness cap (status_ttl): a hard
+// ceiling on whatever freshness() computed — including explicit upstream
+// max-age/Expires. This deliberately differs from nginx proxy_cache_valid,
+// which upstream headers override: a cap also fences off an origin stamping
+// "Cache-Control: public" on an error page. Unlisted statuses are
+// uncapped; a zero cap makes the status unstorable (callers reject
+// fresh <= 0). The cap shortens freshness only — the stored entry still
+// lives through its stale window (expiry + max(swr, sie)).
+func statusCap(ix *index, status int, fresh time.Duration) time.Duration {
+	if d, ok := ix.statusTTL[status]; ok && d < fresh {
+		return d
+	}
+
+	return fresh
 }
 
 // freshness computes the response TTL from the effective Cache-Control
