@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,7 @@ func newTestCache(t *testing.T, mutate func(*FastCache)) *FastCache {
 	fc.ttl, _ = parseDuration(fc.TTL, 0)
 	fc.swr, _ = parseDuration(fc.StaleWhileRevalidate, 0)
 	fc.sie, _ = parseDuration(fc.StaleIfError, 0)
+	fc.statusTTL, _ = parseStatusTTLs(fc.StatusTTL)
 	fc.revalidateTimeout, _ = parseDuration(fc.RevalidateTimeout, 30*time.Second)
 
 	fc.idx = newIndex(fc)
@@ -2297,6 +2299,8 @@ func TestUnmarshalCaddyfile(t *testing.T) {
     ttl                      5m
     stale_while_revalidate   30s
     stale_if_error           1m
+    status_ttl               404 30s
+    status_ttl               500 502 503 10s
     vary                     Accept-Encoding Accept-Language
     disable_touch_on_hit
     purge_allow              10.0.0.0/8 192.168.1.5
@@ -2323,6 +2327,10 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 
 	if got := fc.MatchHeaders["Content-Type"]; len(got) != 2 || got[0] != "image/png" {
 		t.Fatalf("match_header: %+v", fc.MatchHeaders)
+	}
+
+	if fc.StatusTTL[404] != "30s" || fc.StatusTTL[500] != "10s" || fc.StatusTTL[502] != "10s" || fc.StatusTTL[503] != "10s" || len(fc.StatusTTL) != 4 {
+		t.Fatalf("status_ttl: %+v", fc.StatusTTL)
 	}
 
 	// Unknown option → error.
@@ -3765,6 +3773,225 @@ func TestUnmarshalCaddyfileMissingArgs(t *testing.T) {
 			err := fc.UnmarshalCaddyfile(caddyfile.NewTestDispenser("fastcache {\n\t" + opt + "\n}"))
 			if err == nil {
 				t.Fatalf("%s with no argument should be an error", opt)
+			}
+		})
+	}
+}
+
+// statusUpstream serves a fixed status/body, counting calls.
+func statusUpstream(counter *atomic.Int64, status int, body string, headers http.Header) caddyhttp.Handler {
+	return handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		counter.Add(1)
+		for k, vv := range headers {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+
+		return nil
+	})
+}
+
+// hitTTL extracts the ttl= parameter of a hit's Cache-Status header.
+func hitTTL(t *testing.T, w *httptest.ResponseRecorder) int64 {
+	t.Helper()
+
+	cs := w.Header().Get("Cache-Status")
+	for p := range strings.SplitSeq(cs, ";") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(p), "ttl="); ok {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				t.Fatalf("bad ttl param in Cache-Status %q", cs)
+			}
+
+			return n
+		}
+	}
+
+	t.Fatalf("no ttl param in Cache-Status %q", cs)
+
+	return 0
+}
+
+// TestStatusTTL: the per-status cap bounds computed freshness — the
+// default ttl AND explicit upstream max-age — while leaving unlisted
+// statuses alone.
+func TestStatusTTL(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statusTTL map[int]string
+		status    int
+		headers   http.Header
+		minTTL    int64
+		maxTTL    int64 // hit ttl must land inside [minTTL, maxTTL]
+	}{
+		{"caps default ttl", map[int]string{404: "30s"}, http.StatusNotFound, nil, 0, 30},
+		{"caps upstream max-age", map[int]string{200: "30s"}, http.StatusOK,
+			http.Header{"Cache-Control": {"public, max-age=3600"}}, 0, 30},
+		{"smaller upstream max-age wins", map[int]string{200: "30s"}, http.StatusOK,
+			http.Header{"Cache-Control": {"public, max-age=5"}}, 0, 5},
+		{"unlisted status unaffected", map[int]string{404: "30s"}, http.StatusOK,
+			http.Header{"Cache-Control": {"public, max-age=3600"}}, 3500, 3600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := newTestCache(t, func(fc *FastCache) { fc.StatusTTL = tc.statusTTL })
+
+			var calls atomic.Int64
+			next := statusUpstream(&calls, tc.status, "x", tc.headers)
+
+			get(t, fc, "/", nil, next)
+			w := get(t, fc, "/", nil, next)
+
+			if calls.Load() != 1 {
+				t.Fatalf("expected a stored hit, got %d calls", calls.Load())
+			}
+			if w.Code != tc.status {
+				t.Fatalf("expected status %d, got %d", tc.status, w.Code)
+			}
+			if ttl := hitTTL(t, w); ttl < tc.minTTL || ttl > tc.maxTTL {
+				t.Errorf("hit ttl = %ds, want [%d, %d]", ttl, tc.minTTL, tc.maxTTL)
+			}
+		})
+	}
+}
+
+// TestStatusTTLZero: a zero cap makes the status unstorable — every
+// request re-fetches, matching nginx's "not listed in proxy_cache_valid =
+// never cached".
+func TestStatusTTLZero(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.StatusTTL = map[int]string{404: "0"}
+	})
+
+	var calls atomic.Int64
+	next := statusUpstream(&calls, http.StatusNotFound, "missing", nil)
+
+	for i := range 2 {
+		if w := get(t, fc, "/", nil, next); w.Code != http.StatusNotFound {
+			t.Fatalf("request %d: got %d", i, w.Code)
+		}
+	}
+
+	if calls.Load() != 2 {
+		t.Errorf("status_ttl 0 must never store, got %d calls", calls.Load())
+	}
+}
+
+// TestStatusTTLNotAWhitelist: status_ttl tunes freshness only — a status
+// outside the heuristically cacheable set is still never stored.
+func TestStatusTTLNotAWhitelist(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.StatusTTL = map[int]string{302: "30s"}
+	})
+
+	var calls atomic.Int64
+	next := statusUpstream(&calls, http.StatusFound, "x", nil)
+
+	get(t, fc, "/", nil, next)
+	get(t, fc, "/", nil, next)
+
+	if calls.Load() != 2 {
+		t.Errorf("302 must not be stored even with a status_ttl entry, got %d calls", calls.Load())
+	}
+}
+
+// TestStatusTTLExpiry: a capped entry expires at the cap, not at ttl.
+func TestStatusTTLExpiry(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.StatusTTL = map[int]string{404: "50ms"} // default ttl is 1h
+	})
+
+	var calls atomic.Int64
+	next := statusUpstream(&calls, http.StatusNotFound, "missing", nil)
+
+	get(t, fc, "/", nil, next)
+	get(t, fc, "/", nil, next)
+
+	if calls.Load() != 1 {
+		t.Fatalf("expected a stored hit inside the cap, got %d calls", calls.Load())
+	}
+
+	time.Sleep(80 * time.Millisecond)
+
+	get(t, fc, "/", nil, next)
+
+	if calls.Load() != 2 {
+		t.Errorf("expected re-fetch after status_ttl expiry, got %d calls", calls.Load())
+	}
+}
+
+// TestStatusTTLStaleWindow: the cap shortens freshness, not retention — a
+// short-capped entry is still a stale_if_error fallback until staleAt.
+func TestStatusTTLStaleWindow(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.StatusTTL = map[int]string{404: "50ms"}
+		fc.StaleIfError = "5s"
+	})
+
+	var calls atomic.Int64
+	fail := false
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		calls.Add(1)
+
+		if fail {
+			w.WriteHeader(http.StatusBadGateway)
+
+			return nil
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("missing"))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next) // stores 404: fresh 50ms, staleAt = +5.05s
+	time.Sleep(80 * time.Millisecond)
+
+	// Past the capped freshness, inside the SIE window: the 5xx answer
+	// falls back to the stale 404.
+	fail = true
+	w := get(t, fc, "/", nil, next)
+	if w.Code != http.StatusNotFound || w.Body.String() != "missing" {
+		t.Fatalf("expected stale 404 fallback, got %d %q", w.Code, w.Body.String())
+	}
+}
+
+// TestParseStatusTTLs: duration validation — unparseable and negative
+// durations are rejected, zero is allowed (never store).
+func TestParseStatusTTLs(t *testing.T) {
+	if m, err := parseStatusTTLs(nil); m != nil || err != nil {
+		t.Fatalf("nil map: got %v, %v", m, err)
+	}
+
+	for _, s := range []string{"bogus", "-5s"} {
+		if _, err := parseStatusTTLs(map[int]string{404: s}); err == nil {
+			t.Errorf("status_ttl duration %q should be an error", s)
+		}
+	}
+
+	m, err := parseStatusTTLs(map[int]string{404: "30s", 500: "0"})
+	if err != nil || m[404] != 30*time.Second || m[500] != 0 {
+		t.Fatalf("parseStatusTTLs = %v, %v", m, err)
+	}
+}
+
+// TestStatusTTLCaddyfileErrors: status_ttl needs at least one status code
+// plus a duration, and every code must be a valid HTTP status.
+func TestStatusTTLCaddyfileErrors(t *testing.T) {
+	for _, line := range []string{
+		"status_ttl",
+		"status_ttl 404",
+		"status_ttl x 30s",
+		"status_ttl 99 30s",
+		"status_ttl 600 30s",
+	} {
+		t.Run(line, func(t *testing.T) {
+			var fc FastCache
+			if err := fc.UnmarshalCaddyfile(caddyfile.NewTestDispenser("fastcache {\n\t" + line + "\n}")); err == nil {
+				t.Errorf("%q should be an error", line)
 			}
 		})
 	}

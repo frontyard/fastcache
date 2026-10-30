@@ -157,6 +157,7 @@ type index struct {
 	defaultTTL   time.Duration
 	swr          time.Duration
 	sie          time.Duration
+	statusTTL    map[int]time.Duration
 	varyList     []string
 	noTouch      bool
 	honorReqCC   bool
@@ -198,6 +199,7 @@ func newIndex(cfg *FastCache) *index {
 		defaultTTL:   cfg.ttl,
 		swr:          cfg.swr,
 		sie:          cfg.sie,
+		statusTTL:    cfg.statusTTL,
 		varyList:     cfg.Vary,
 		noTouch:      cfg.DisableTouchOnHit,
 		honorReqCC:   cfg.HonorRequestCC,
@@ -949,7 +951,7 @@ func (ix *index) refresh304(e *entry, h http.Header) {
 		now = now.Add(-time.Duration(a) * time.Second)
 	}
 
-	fresh := freshness(ix, merged)
+	fresh := statusCap(ix, e.status, freshness(ix, merged))
 	e.storedAt.Store(now.UnixNano())
 	e.expiresAt.Store(now.Add(fresh).UnixNano())
 	e.staleAt.Store(now.Add(fresh + max(ix.swr, ix.sie)).UnixNano())
