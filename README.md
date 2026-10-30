@@ -303,6 +303,10 @@ localhost:2020 {
 instances in one config share the collectors: counters split per name,
 same-named instances aggregate, and gauges sum live instances per name.
 
+A Grafana dashboard over these metrics:
+
+![Grafana dashboard: cache entries, outcome share, revalidation and upstream-error gauges, request rate by outcome, evictions by reason, hit ratio](docs/grafana-dashboard.png)
+
 ## Architecture
 
 | File           | Role                                                                                                                                                                                     |
