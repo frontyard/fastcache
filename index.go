@@ -162,6 +162,7 @@ type index struct {
 	honorReqCC   bool
 	storeCookie  bool
 	ramOnly      bool // disk_size 0: bodies live in RAM only, nothing is persisted
+	name         string
 	keyTmpl      string
 	matchHeaders map[string][]string // canonical name -> allowed values
 	metrics      *cacheMetrics
@@ -202,6 +203,7 @@ func newIndex(cfg *FastCache) *index {
 		honorReqCC:   cfg.HonorRequestCC,
 		storeCookie:  cfg.StoreSetCookie,
 		ramOnly:      cfg.diskBytes <= 0,
+		name:         cfg.Name,
 		keyTmpl:      cfg.CacheKey,
 		matchHeaders: func() map[string][]string {
 			if len(cfg.MatchHeaders) == 0 {
@@ -217,7 +219,7 @@ func newIndex(cfg *FastCache) *index {
 		}(),
 		evictCh:   make(chan struct{}, 1),
 		sweepStop: make(chan struct{}),
-		metrics:   newCacheMetrics(),
+		metrics:   newCacheMetrics(cfg.Name),
 		logger:    cfg.logger,
 	}
 

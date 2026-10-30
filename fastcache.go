@@ -37,6 +37,7 @@ func init() {
 // FastCache is the http.handlers.fastcache module.
 type FastCache struct {
 	Path                 string              `json:"path,omitempty"`
+	Name                 string              `json:"name,omitempty"`
 	MemorySize           string              `json:"memory_size,omitempty"`
 	DiskSize             string              `json:"disk_size,omitempty"`
 	MaxItems             int                 `json:"max_items,omitempty"`
@@ -850,6 +851,12 @@ func (fc *FastCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
+			case "name":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+
+				fc.Name = d.Val()
 			case "path":
 				if !d.NextArg() {
 					return d.ArgErr()

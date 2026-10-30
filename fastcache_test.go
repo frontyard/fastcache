@@ -2290,6 +2290,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 
 	d := caddyfile.NewTestDispenser(`fastcache {
     path                     /var/cache/x
+    name                     edge
     memory_size              32MB
     disk_size                512MB
     max_items                100
@@ -2309,7 +2310,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		t.Fatalf("UnmarshalCaddyfile: %v", err)
 	}
 
-	if fc.Path != "/var/cache/x" || fc.MemorySize != "32MB" || fc.DiskSize != "512MB" ||
+	if fc.Path != "/var/cache/x" || fc.Name != "edge" || fc.MemorySize != "32MB" || fc.DiskSize != "512MB" ||
 		fc.MaxItems != 100 || fc.TTL != "5m" || fc.StaleWhileRevalidate != "30s" ||
 		fc.StaleIfError != "1m" || fc.CacheKey != "{http.request.host}{http.request.uri.path}" ||
 		!fc.DisableTouchOnHit || !fc.HonorRequestCC || fc.PromoteBelow != "32KB" {
@@ -2402,12 +2403,12 @@ func TestMetrics(t *testing.T) {
 
 	m := fc.idx.metrics
 	for result, want := range map[string]float64{"miss": 2, "hit": 1, "bypass": 1, "purged": 1} {
-		if got := testutil.ToFloat64(m.requests.WithLabelValues(result)); got != want {
+		if got := testutil.ToFloat64(m.requests.WithLabelValues("", result)); got != want {
 			t.Fatalf("requests_total{result=%q} = %v, want %v", result, got, want)
 		}
 	}
 	for reason, want := range map[string]float64{"purge": 1, "invalidate": 1} {
-		if got := testutil.ToFloat64(m.evictions.WithLabelValues(reason)); got != want {
+		if got := testutil.ToFloat64(m.evictions.WithLabelValues("", reason)); got != want {
 			t.Fatalf("evictions_total{reason=%q} = %v, want %v", reason, got, want)
 		}
 	}
@@ -2462,7 +2463,7 @@ func TestMetricsRevalidation(t *testing.T) {
 		t.Fatalf("expected merged entry body, got %q", w.Body.String())
 	}
 
-	if got := testutil.ToFloat64(fc.idx.metrics.revalidations.WithLabelValues("not_modified")); got != 1 {
+	if got := testutil.ToFloat64(fc.idx.metrics.revalidations.WithLabelValues("", "not_modified")); got != 1 {
 		t.Fatalf("revalidations{not_modified} = %v, want 1", got)
 	}
 }
@@ -3623,10 +3624,10 @@ func TestLastModified(t *testing.T) {
 func TestMetricsRegisterReuse(t *testing.T) {
 	reg := prometheus.NewRegistry()
 
-	m1 := newCacheMetrics()
+	m1 := newCacheMetrics("")
 	m1.register(reg)
 
-	m2 := newCacheMetrics()
+	m2 := newCacheMetrics("")
 	m2.register(reg)
 
 	if m1.requests != m2.requests || m1.evictions != m2.evictions {
@@ -3647,8 +3648,10 @@ func TestMetricsRegisterReuse(t *testing.T) {
 			continue
 		}
 		for _, c := range mf.GetMetric() {
-			if c.GetLabel()[0].GetValue() == "hit" {
-				found = c.GetCounter().GetValue()
+			for _, l := range c.GetLabel() {
+				if l.GetName() == "result" && l.GetValue() == "hit" {
+					found = c.GetCounter().GetValue()
+				}
 			}
 		}
 	}
@@ -3657,13 +3660,47 @@ func TestMetricsRegisterReuse(t *testing.T) {
 		t.Fatalf("counters should aggregate across instances, got %v", found)
 	}
 
+	// A named instance reports its own series, separate from the unnamed one.
+	m3 := newCacheMetrics("ram")
+	m3.register(reg)
+	m3.req("hit")
+
+	got, err = reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	series := map[string]float64{}
+	for _, mf := range got {
+		if mf.GetName() != "fastcache_requests_total" {
+			continue
+		}
+		for _, c := range mf.GetMetric() {
+			var name, result string
+			for _, l := range c.GetLabel() {
+				switch l.GetName() {
+				case "name":
+					name = l.GetValue()
+				case "result":
+					result = l.GetValue()
+				}
+			}
+			if result == "hit" {
+				series[name] = c.GetCounter().GetValue()
+			}
+		}
+	}
+	if series[""] != 2 || series["ram"] != 1 {
+		t.Fatalf("name label should split series, got %v", series)
+	}
+
 	// sumIndexes sees live instances and skips ones with a nil index.
 	fc := newTestCache(t, nil)
 	liveCaches.Store(fc, struct{}{})
 	liveCaches.Store(&FastCache{}, struct{}{}) // never provisioned
 	defer liveCaches.Delete(fc)
 
-	if total := sumIndexes(func(ix *index) int64 { return ix.fileCount.Load() }); total != 0 {
+	if total := sumIndexes("", func(ix *index) int64 { return ix.fileCount.Load() }); total != 0 {
 		t.Fatalf("sumIndexes = %d, want 0", total)
 	}
 }

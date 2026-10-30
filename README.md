@@ -100,23 +100,24 @@ into the cache while streaming it to the client.
 
 ### Options
 
-| Option                        | Default                | Meaning                                                                                   |
-|-------------------------------|------------------------|-------------------------------------------------------------------------------------------|
-| `path`                        | `/var/cache/fastcache` | Directory for body files + `.meta` sidecars                                               |
-| `memory_size`                 | `64MB`                 | RAM body-tier budget (humanize sizes or bytes); `0` = disk-only mode                      |
-| `disk_size`                   | `1GB`                  | Disk-tier budget; `0` = RAM-only mode (no files, no persistence)                          |
-| `max_items`                   | unlimited              | Cap on cached entries                                                                     |
-| `ttl`                         | `1h`                   | Fallback freshness when the response carries no `max-age`/`s-maxage`/`Expires`            |
-| `stale_while_revalidate`      | `0` (off)              | Serve an expired entry while one background refresh runs                                  |
-| `stale_if_error`              | `0` (off)              | Retain expired entries this long as upstream-failure fallback (see below)                 |
-| `revalidate_timeout`          | `30s`                  | Bound on any single upstream revalidation (`0` = unbounded)                               |
-| `cache_key`                   | `{host}{requestURI}`   | Cache key as a caddy placeholder template, e.g. `{http.request.host}{http.request.uri.path}` |
-| `match_header`                | none                   | Store only responses whose header `<name>` equals one of the given values (repeatable)    |
-| `vary`                        | none                   | Whitelist of `Vary` header names to key on                                                |
-| `disable_touch_on_hit`        | off                    | Skip the LRU timestamp update on hits (rarely needed — the touch is a coarse atomic write) |
-| `purge_allow`                 | loopback only          | IPs/CIDRs allowed to send `PURGE`                                                         |
-| `honor_request_cache_control` | off                    | Honor client `no-cache`/`no-store`/`Pragma` as a bypass (default ignores them, nginx-style) |
-| `promote_below`               | `16KB`                 | Only bodies up to this size promote to the RAM tier; larger ones always serve via sendfile. `0` = never promote |
+| Option                        | Default                | Meaning                                                                                                                                                                                  |
+|-------------------------------|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `path`                        | `/var/cache/fastcache` | Directory for body files + `.meta` sidecars                                                                                                                                              |
+| `name`                        | none                   | Instance name for the `name` metric label; unnamed instances aggregate under `name=""`                                                                                                   |
+| `memory_size`                 | `64MB`                 | RAM body-tier budget (humanize sizes or bytes); `0` = disk-only mode                                                                                                                     |
+| `disk_size`                   | `1GB`                  | Disk-tier budget; `0` = RAM-only mode (no files, no persistence)                                                                                                                         |
+| `max_items`                   | unlimited              | Cap on cached entries                                                                                                                                                                    |
+| `ttl`                         | `1h`                   | Fallback freshness when the response carries no `max-age`/`s-maxage`/`Expires`                                                                                                           |
+| `stale_while_revalidate`      | `0` (off)              | Serve an expired entry while one background refresh runs                                                                                                                                 |
+| `stale_if_error`              | `0` (off)              | Retain expired entries this long as upstream-failure fallback (see below)                                                                                                                |
+| `revalidate_timeout`          | `30s`                  | Bound on any single upstream revalidation (`0` = unbounded)                                                                                                                              |
+| `cache_key`                   | `{host}{requestURI}`   | Cache key as a caddy placeholder template, e.g. `{http.request.host}{http.request.uri.path}`                                                                                             |
+| `match_header`                | none                   | Store only responses whose header `<name>` equals one of the given values (repeatable)                                                                                                   |
+| `vary`                        | none                   | Whitelist of `Vary` header names to key on                                                                                                                                               |
+| `disable_touch_on_hit`        | off                    | Skip the LRU timestamp update on hits (rarely needed — the touch is a coarse atomic write)                                                                                               |
+| `purge_allow`                 | loopback only          | IPs/CIDRs allowed to send `PURGE`                                                                                                                                                        |
+| `honor_request_cache_control` | off                    | Honor client `no-cache`/`no-store`/`Pragma` as a bypass (default ignores them, nginx-style)                                                                                              |
+| `promote_below`               | `16KB`                 | Only bodies up to this size promote to the RAM tier; larger ones always serve via sendfile. `0` = never promote                                                                          |
 | `store_set_cookie`            | off                    | Store responses carrying `Set-Cookie`. Off by default: a stored cookie is replayed to every later client (session fixation). Only enable for upstreams whose Set-Cookie is safe to share |
 
 `path` must be a dedicated directory per `fastcache` block — the cache owns
@@ -289,27 +290,29 @@ localhost:2020 {
 }
 ```
 
-| Metric                          | Type    | Labels                                                            |
-|---------------------------------|---------|-------------------------------------------------------------------|
-| `fastcache_requests_total`      | counter | `result`: `hit` `stale` `miss` `bypass` `purged` `revalidated`    |
-| `fastcache_revalidations_total` | counter | `result`: `ok` `not_modified` (304 merge) `error`                 |
-| `fastcache_evictions_total`     | counter | `reason`: `expired` `disk` `count` `memory` `purge` `invalidate`  |
-| `fastcache_entries`             | gauge   | —                                                                 |
-| `fastcache_bytes`               | gauge   | `tier`: `memory` `disk`                                           |
+| Metric                          | Type    | Labels                                                                   |
+|---------------------------------|---------|--------------------------------------------------------------------------|
+| `fastcache_requests_total`      | counter | `name`, `result`: `hit` `stale` `miss` `bypass` `purged` `revalidated`   |
+| `fastcache_revalidations_total` | counter | `name`, `result`: `ok` `not_modified` (304 merge) `error`                |
+| `fastcache_evictions_total`     | counter | `name`, `reason`: `expired` `disk` `count` `memory` `purge` `invalidate` |
+| `fastcache_entries`             | gauge   | `name`                                                                   |
+| `fastcache_bytes`               | gauge   | `name`, `tier`: `memory` `disk`                                          |
 
-Label sets are bounded (no per-key labels). Multiple `fastcache` instances in
-one config share the collectors; gauges sum across live instances.
+`name` is the instance's `name` option — instances without one report
+`name=""`. Label sets are bounded (no per-key labels). Multiple `fastcache`
+instances in one config share the collectors: counters split per name,
+same-named instances aggregate, and gauges sum live instances per name.
 
 ## Architecture
 
-| File           | Role                                                                                                                                           |
-|----------------|------------------------------------------------------------------------------------------------------------------------------------------------|
-| `fastcache.go` | Module registration, config/Caddyfile parsing, `ServeHTTP` (bypass → hit → SWR → singleflight miss), PURGE                                    |
-| `index.go`     | The cache index: key mappings, variant sets, RAM/disk accounting, near-LRU eviction, expiry heap + sweeper, sidecar IO, startup rebuild       |
+| File           | Role                                                                                                                                                                                     |
+|----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `fastcache.go` | Module registration, config/Caddyfile parsing, `ServeHTTP` (bypass → hit → SWR → singleflight miss), PURGE                                                                               |
+| `index.go`     | The cache index: key mappings, variant sets, RAM/disk accounting, near-LRU eviction, expiry heap + sweeper, sidecar IO, startup rebuild                                                  |
 | `capture.go`   | `captureWriter` — buffers upstream headers privately (a swallowed/failed response never leaks headers), tees the body to a `.tmp` file, commits by atomic rename (body first, meta last) |
-| `cacheable.go` | Request bypass, response cacheability, freshness math, `Vary` handling                                                                        |
-| `admin.go`     | `admin.api.fastcache` — `GET /fastcache/keys`, `DELETE /fastcache/purge` (regex)                                                              |
-| `metrics.go`   | Prometheus collectors registered into the config's shared registry                                                                            |
+| `cacheable.go` | Request bypass, response cacheability, freshness math, `Vary` handling                                                                                                                   |
+| `admin.go`     | `admin.api.fastcache` — `GET /fastcache/keys`, `DELETE /fastcache/purge` (regex)                                                                                                         |
+| `metrics.go`   | Prometheus collectors registered into the config's shared registry                                                                                                                       |
 
 ### Keying and variants
 

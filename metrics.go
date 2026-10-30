@@ -11,6 +11,7 @@ import (
 // and registered into the shared caddy registry in Provision, which is also
 // what the http.handlers.metrics module serves at /metrics.
 type cacheMetrics struct {
+	name          string                 // the instance's `name` option; "" aggregates unnamed instances
 	requests      *prometheus.CounterVec // result: hit|stale|miss|bypass|purged|revalidated
 	revalidations *prometheus.CounterVec // result: ok|not_modified|error
 	evictions     *prometheus.CounterVec // reason: expired|disk|count|memory|purge|invalidate
@@ -23,23 +24,24 @@ type cacheMetrics struct {
 	evictC map[string]prometheus.Counter
 }
 
-func newCacheMetrics() *cacheMetrics {
+func newCacheMetrics(name string) *cacheMetrics {
 	m := &cacheMetrics{
+		name: name,
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "fastcache",
 			Name:      "requests_total",
 			Help:      "Requests handled by the cache, by outcome.",
-		}, []string{"result"}),
+		}, []string{"name", "result"}),
 		revalidations: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "fastcache",
 			Name:      "revalidations_total",
 			Help:      "Upstream revalidations of stale entries, by outcome (ok = fresh body stored, not_modified = 304 merge, error = upstream failure).",
-		}, []string{"result"}),
+		}, []string{"name", "result"}),
 		evictions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "fastcache",
 			Name:      "evictions_total",
 			Help:      "Entries removed from the index, by reason (expired, disk/count/memory budget, purge, invalidate).",
-		}, []string{"reason"}),
+		}, []string{"name", "reason"}),
 	}
 
 	// Pre-create every label child so a scrape always shows the families,
@@ -55,17 +57,17 @@ func newCacheMetrics() *cacheMetrics {
 func (m *cacheMetrics) resolve() {
 	m.reqC = map[string]prometheus.Counter{}
 	for _, r := range []string{"hit", "stale", "miss", "bypass", "purged", "revalidated"} {
-		m.reqC[r] = m.requests.WithLabelValues(r)
+		m.reqC[r] = m.requests.WithLabelValues(m.name, r)
 	}
 
 	m.revalC = map[string]prometheus.Counter{}
 	for _, r := range []string{"ok", "not_modified", "error"} {
-		m.revalC[r] = m.revalidations.WithLabelValues(r)
+		m.revalC[r] = m.revalidations.WithLabelValues(m.name, r)
 	}
 
 	m.evictC = map[string]prometheus.Counter{}
 	for _, r := range []string{"expired", "disk", "count", "memory", "purge", "invalidate"} {
-		m.evictC[r] = m.evictions.WithLabelValues(r)
+		m.evictC[r] = m.evictions.WithLabelValues(m.name, r)
 	}
 }
 
@@ -74,41 +76,45 @@ func (m *cacheMetrics) reval(result string) { m.revalC[result].Inc() }
 func (m *cacheMetrics) evict(reason string) { m.evictC[reason].Inc() }
 
 // register attaches the collectors to the config's shared metrics registry.
-// A second FastCache instance reuses the already-registered collectors, so
-// counters aggregate across instances — as do the gauges, which sum all
-// live instances.
+// Other FastCache instances reuse the already-registered counter vecs — the
+// `name` label keeps their series distinct, and same-named instances
+// aggregate, as do the gauges, which sum all live instances per name.
 func (m *cacheMetrics) register(reg *prometheus.Registry) {
 	m.requests = registerOrReuse(reg, m.requests)
 	m.revalidations = registerOrReuse(reg, m.revalidations)
 	m.evictions = registerOrReuse(reg, m.evictions)
 	m.resolve()
 
+	name := m.name
+
 	registerOrReuse(reg, prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Namespace: "fastcache",
-		Name:      "entries",
-		Help:      "Currently indexed cache entries (all instances).",
-	}, func() float64 { return float64(sumIndexes(func(ix *index) int64 { return ix.fileCount.Load() })) }))
+		Namespace:   "fastcache",
+		Name:        "entries",
+		Help:        "Currently indexed cache entries (all instances of the name).",
+		ConstLabels: prometheus.Labels{"name": name},
+	}, func() float64 { return float64(sumIndexes(name, func(ix *index) int64 { return ix.fileCount.Load() })) }))
 
 	registerOrReuse(reg, prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace:   "fastcache",
 		Name:        "bytes",
-		Help:        "Bytes held by the cache tiers (all instances).",
-		ConstLabels: prometheus.Labels{"tier": "memory"},
-	}, func() float64 { return float64(sumIndexes(func(ix *index) int64 { return ix.memSize.Load() })) }))
+		Help:        "Bytes held by the cache tiers (all instances of the name).",
+		ConstLabels: prometheus.Labels{"name": name, "tier": "memory"},
+	}, func() float64 { return float64(sumIndexes(name, func(ix *index) int64 { return ix.memSize.Load() })) }))
 
 	registerOrReuse(reg, prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace:   "fastcache",
 		Name:        "bytes",
-		Help:        "Bytes held by the cache tiers (all instances).",
-		ConstLabels: prometheus.Labels{"tier": "disk"},
-	}, func() float64 { return float64(sumIndexes(func(ix *index) int64 { return ix.diskSize.Load() })) }))
+		Help:        "Bytes held by the cache tiers (all instances of the name).",
+		ConstLabels: prometheus.Labels{"name": name, "tier": "disk"},
+	}, func() float64 { return float64(sumIndexes(name, func(ix *index) int64 { return ix.diskSize.Load() })) }))
 }
 
-// sumIndexes totals fn over the index of every provisioned instance.
-func sumIndexes(fn func(*index) int64) int64 {
+// sumIndexes totals fn over the index of every live instance with the
+// given name ("" sums the unnamed instances).
+func sumIndexes(name string, fn func(*index) int64) int64 {
 	var total int64
 	liveCaches.Range(func(k, _ any) bool {
-		if ix := k.(*FastCache).idx; ix != nil {
+		if ix := k.(*FastCache).idx; ix != nil && ix.name == name {
 			total += fn(ix)
 		}
 		return true
