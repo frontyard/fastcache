@@ -62,6 +62,7 @@ type FastCache struct {
 	revalidateTimeout time.Duration
 	purgeNets         []netip.Prefix
 
+	logger  *zap.Logger
 	idx     *index
 	flights sync.Map // flight key -> chan struct{}
 }
@@ -76,6 +77,8 @@ func (*FastCache) CaddyModule() caddy.ModuleInfo {
 
 // Provision implements caddy.Provisioner.
 func (fc *FastCache) Provision(ctx caddy.Context) error {
+	fc.logger = ctx.Logger()
+
 	if fc.Path == "" {
 		fc.Path = "/var/cache/fastcache"
 	}
@@ -155,7 +158,7 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 		return true
 	})
 	if warned {
-		ctx.Logger().Warn("fastcache instances share a cache directory; they will index and evict each other's entries",
+		fc.logger.Warn("fastcache instances share a cache directory; they will index and evict each other's entries",
 			zap.String("path", fc.Path))
 	}
 
@@ -214,6 +217,9 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
 	default:
 		w.Header().Set("Cache-Status", "fastcache; fwd=request; detail=method")
+		if ce := fc.logger.Check(zap.DebugLevel, "request bypassed cache"); ce != nil {
+			ce.Write(zap.String("key", fc.idx.baseKey(r)), zap.String("reason", "unsafe method"))
+		}
 
 		sw := &statusRW{ResponseWriter: w, status: http.StatusOK}
 		err := next.ServeHTTP(sw, r)
@@ -258,6 +264,9 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	if requestBypass(fc.idx, r) {
 		w.Header().Set("Cache-Status", "fastcache; fwd=request; detail=bypass")
 		fc.idx.metrics.req("bypass")
+		if ce := fc.logger.Check(zap.DebugLevel, "request bypassed cache"); ce != nil {
+			ce.Write(zap.String("key", fc.idx.baseKey(r)), zap.String("reason", "request headers"))
+		}
 
 		return next.ServeHTTP(w, r)
 	}
@@ -272,6 +281,9 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		if hit {
 			if !stale {
 				fc.idx.metrics.req("hit")
+				if ce := fc.logger.Check(zap.DebugLevel, "cache hit"); ce != nil {
+					ce.Write(zap.String("key", e.key), zap.Int("status", e.status), zap.Int64("size", e.size))
+				}
 
 				cs := []string{"hit", ttlParam(e)}
 				if tries > 0 {
@@ -285,6 +297,9 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 			if !mr && fc.idx.withinSWR(e, time.Now().UnixNano()) {
 				fc.refresh(e, r, next)
 				fc.idx.metrics.req("stale")
+				if ce := fc.logger.Check(zap.DebugLevel, "serving stale; revalidating in background"); ce != nil {
+					ce.Write(zap.String("key", e.key))
+				}
 
 				return fc.serveEntry(w, r, e, next, "hit", "fwd=stale")
 			}
@@ -298,6 +313,9 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 			done, leader := fc.startFlight("reval:" + e.key)
 			if leader {
 				fc.idx.metrics.req("revalidated")
+				if ce := fc.logger.Check(zap.DebugLevel, "revalidating stale entry"); ce != nil {
+					ce.Write(zap.String("key", e.key), zap.Bool("must_revalidate", mr))
+				}
 				err := fc.revalidateOrStale(w, r, e, next)
 				fc.finishFlight("reval:"+e.key, done)
 
@@ -306,10 +324,16 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 
 			if !mr {
 				fc.idx.metrics.req("stale")
+				if ce := fc.logger.Check(zap.DebugLevel, "serving stale; revalidation in flight"); ce != nil {
+					ce.Write(zap.String("key", e.key))
+				}
 
 				return fc.serveEntry(w, r, e, next, "hit", "fwd=stale", "collapsed")
 			}
 
+			if ce := fc.logger.Check(zap.DebugLevel, "awaiting in-flight revalidation"); ce != nil {
+				ce.Write(zap.String("key", e.key))
+			}
 			select {
 			case <-done:
 			case <-r.Context().Done():
@@ -328,6 +352,9 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		done, leader := fc.startFlight(flightKey)
 		if leader {
 			fc.idx.metrics.req("miss")
+			if ce := fc.logger.Check(zap.DebugLevel, "cache miss"); ce != nil {
+				ce.Write(zap.String("key", flightKey))
+			}
 			err := fc.fetchAndStore(w, r, base, next)
 			fc.finishFlight(flightKey, done)
 
@@ -339,10 +366,16 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 			// uncacheable responses under churn): fetch directly rather
 			// than queue on yet another flight.
 			fc.idx.metrics.req("miss")
+			if ce := fc.logger.Check(zap.DebugLevel, "flight wait limit reached; fetching upstream directly"); ce != nil {
+				ce.Write(zap.String("key", base))
+			}
 
 			return fc.fetchAndStore(w, r, base, next)
 		}
 
+		if ce := fc.logger.Check(zap.DebugLevel, "coalescing with in-flight request"); ce != nil {
+			ce.Write(zap.String("key", flightKey))
+		}
 		select {
 		case <-done:
 		case <-r.Context().Done():
@@ -384,6 +417,10 @@ func (fc *FastCache) revalidateOrStale(w http.ResponseWriter, r *http.Request, e
 
 	if err = next.ServeHTTP(cw, r2); err != nil && !cw.wrote && !cw.swallow && !e.mustRevalidate.Load() {
 		// The handler failed before anything reached the client.
+		if ce := fc.logger.Check(zap.DebugLevel, "revalidation failed; serving stale entry"); ce != nil {
+			ce.Write(zap.String("key", e.key), zap.Error(err))
+		}
+
 		return fc.serveEntry(w, r, e, next, "hit", "fwd=stale")
 	}
 
@@ -513,6 +550,11 @@ func (fc *FastCache) refresh(e *entry, r *http.Request, next caddyhttp.Handler) 
 		cw.ownVal = ownVal
 
 		err := next.ServeHTTP(cw, req)
+		if err != nil {
+			if ce := fc.logger.Check(zap.DebugLevel, "background revalidation failed"); ce != nil {
+				ce.Write(zap.String("key", e.key), zap.Error(err))
+			}
+		}
 		cw.Close(err)
 	}()
 }
@@ -603,6 +645,9 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 
 		if f, done, err = fc.idx.openBody(e); err != nil {
 			// File vanished under us — drop the index entry and go upstream.
+			if ce := fc.logger.Check(zap.DebugLevel, "body file missing; dropping entry and refetching"); ce != nil {
+				ce.Write(zap.String("key", e.key), zap.String("path", e.path), zap.Error(err))
+			}
 			fc.idx.deleteEntry(e)
 
 			return fc.fetchAndStore(w, r, e.baseKey, next)
@@ -767,6 +812,9 @@ func (fc *FastCache) purgeAllowed(r *http.Request) bool {
 
 func (fc *FastCache) handlePurge(w http.ResponseWriter, r *http.Request) error {
 	if !fc.purgeAllowed(r) {
+		if ce := fc.logger.Check(zap.DebugLevel, "PURGE denied"); ce != nil {
+			ce.Write(zap.String("remote", r.RemoteAddr), zap.String("key", fc.idx.baseKey(r)))
+		}
 		w.Header().Set("Cache-Status", "fastcache; fwd=request; detail=purge-denied")
 		w.WriteHeader(http.StatusForbidden)
 

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
 )
 
 // fileMagic identifies cache entry files written by this plugin. FCH2
@@ -164,6 +165,7 @@ type index struct {
 	keyTmpl      string
 	matchHeaders map[string][]string // canonical name -> allowed values
 	metrics      *cacheMetrics
+	logger       *zap.Logger
 
 	memSize   atomic.Int64
 	diskSize  atomic.Int64
@@ -181,6 +183,11 @@ type index struct {
 }
 
 func newIndex(cfg *FastCache) *index {
+	// Construction without Provision (tests) leaves cfg.logger nil.
+	if cfg.logger == nil {
+		cfg.logger = zap.NewNop()
+	}
+
 	ix := &index{
 		dir:          cfg.Path,
 		memBudget:    cfg.memoryBytes,
@@ -211,6 +218,7 @@ func newIndex(cfg *FastCache) *index {
 		evictCh:   make(chan struct{}, 1),
 		sweepStop: make(chan struct{}),
 		metrics:   newCacheMetrics(),
+		logger:    cfg.logger,
 	}
 
 	// Seeding from the clock keeps file names unique across restarts: a
@@ -254,6 +262,9 @@ func (ix *index) lookup(r *http.Request) (e *entry, stale, hit bool) {
 	if e.dead(now) {
 		if ix.deleteEntry(e) {
 			ix.metrics.evict("expired")
+			if ce := ix.logger.Check(zap.DebugLevel, "evicting expired entry"); ce != nil {
+				ce.Write(zap.String("key", e.key))
+			}
 		}
 
 		return nil, false, false
@@ -321,10 +332,18 @@ func (ix *index) commit(e *entry) {
 	// re-verify before calling it committed. The dropFile covers the lost
 	// commit-race case too: our files are orphaned whichever way we lost.
 	if v, ok := ix.entries.Load(e.key); !ok || v != e || ix.purgeSeq.Load() != e.purgeAt {
+		if ce := ix.logger.Check(zap.DebugLevel, "commit aborted; entry raced a purge"); ce != nil {
+			ce.Write(zap.String("key", e.key))
+		}
 		ix.deleteEntry(e)
 		ix.dropFile(e)
 
 		return
+	}
+
+	if ce := ix.logger.Check(zap.DebugLevel, "stored entry"); ce != nil {
+		ce.Write(zap.String("key", e.key), zap.Int("status", e.status),
+			zap.Int64("size", e.size), zap.Bool("in_memory", e.body.Load() != nil))
 	}
 
 	ix.maybeEvict()
@@ -410,6 +429,9 @@ func (ix *index) reapExpired() {
 			e := v.(*entry)
 			if e.staleAt.Load() == item.staleAt && ix.deleteEntry(e) {
 				ix.metrics.evict("expired")
+				if ce := ix.logger.Check(zap.DebugLevel, "evicting expired entry"); ce != nil {
+					ce.Write(zap.String("key", e.key))
+				}
 			}
 		}
 	}
@@ -528,6 +550,10 @@ func (ix *index) enforceDiskBudget() {
 		if ix.deleteEntry(e) {
 			ix.metrics.evict("disk")
 			over -= e.fileSize
+			if ce := ix.logger.Check(zap.DebugLevel, "evicting entry"); ce != nil {
+				ce.Write(zap.String("key", e.key), zap.String("reason", "disk budget"),
+					zap.Int64("size", e.fileSize))
+			}
 		}
 	}
 }
@@ -552,6 +578,9 @@ func (ix *index) enforceCountCap() {
 		if ix.deleteEntry(e) {
 			ix.metrics.evict("count")
 			over--
+			if ce := ix.logger.Check(zap.DebugLevel, "evicting entry"); ce != nil {
+				ce.Write(zap.String("key", e.key), zap.String("reason", "max_items"))
+			}
 		}
 	}
 }
@@ -579,6 +608,10 @@ func (ix *index) freeRAM() {
 			if ix.deleteEntry(e) {
 				ix.metrics.evict("memory")
 				over -= e.size
+				if ce := ix.logger.Check(zap.DebugLevel, "evicting entry"); ce != nil {
+					ce.Write(zap.String("key", e.key), zap.String("reason", "memory budget"),
+						zap.Int64("size", e.size))
+				}
 			}
 
 			continue
@@ -592,6 +625,9 @@ func (ix *index) freeRAM() {
 
 		ix.memSize.Add(-int64(len(*b)))
 		over -= int64(len(*b))
+		if ce := ix.logger.Check(zap.DebugLevel, "demoting entry body to disk tier"); ce != nil {
+			ce.Write(zap.String("key", e.key), zap.Int64("size", e.size))
+		}
 	}
 }
 
@@ -623,6 +659,10 @@ func (ix *index) openBody(e *entry) (*os.File, func(), error) {
 			// The serve consumed f, so read from offset 0 explicitly (pread).
 			data := make([]byte, e.size)
 			if _, rerr := io.ReadFull(io.NewSectionReader(f, 0, e.size), data); rerr != nil {
+				if ce := ix.logger.Check(zap.DebugLevel, "RAM promotion read failed"); ce != nil {
+					ce.Write(zap.String("key", e.key), zap.Error(rerr))
+				}
+
 				return
 			}
 
@@ -884,6 +924,10 @@ func (ix *index) rebuild() error {
 	// the eviction worker otherwise.
 	ix.maybeEvict()
 
+	ix.logger.Info("cache index rebuilt",
+		zap.Int("entries", int(ix.fileCount.Load())),
+		zap.Int64("disk_size", ix.diskSize.Load()))
+
 	return nil
 }
 
@@ -930,6 +974,8 @@ func (ix *index) persistMeta(e *entry) {
 	tmp := e.metaPath + ".tmp"
 	mf, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
 	if err != nil {
+		ix.logger.Warn("cannot write meta sidecar", zap.String("path", tmp), zap.Error(err))
+
 		return
 	}
 
@@ -937,11 +983,13 @@ func (ix *index) persistMeta(e *entry) {
 	_ = mf.Close()
 
 	if werr != nil {
+		ix.logger.Warn("cannot write meta sidecar", zap.String("path", tmp), zap.Error(werr))
 		_ = os.Remove(tmp)
 		return
 	}
 
 	if err := os.Rename(tmp, e.metaPath); err != nil {
+		ix.logger.Warn("cannot commit meta sidecar", zap.String("path", e.metaPath), zap.Error(err))
 		_ = os.Remove(tmp)
 		return
 	}
@@ -981,6 +1029,11 @@ func (ix *index) purge(base, reason string) int {
 		if ix.deleteEntry(e) {
 			ix.metrics.evict(reason)
 		}
+	}
+
+	if ce := ix.logger.Check(zap.DebugLevel, "purged key"); ce != nil {
+		ce.Write(zap.String("base", base), zap.String("reason", reason),
+			zap.Int("variants", len(toDelete)))
 	}
 
 	return len(toDelete)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
 )
 
 // captureWriter wraps the downstream ResponseWriter on a miss. It streams
@@ -104,6 +105,9 @@ func (cw *captureWriter) decide(status int) {
 		cw.swallow = true
 		cw.merged304 = true
 		cw.ix.refresh304(cw.reval, cw.hdr)
+		if ce := cw.fc.logger.Check(zap.DebugLevel, "revalidated entry via 304 merge"); ce != nil {
+			ce.Write(zap.String("key", cw.reval.key))
+		}
 		_ = cw.fc.serveEntry(cw.rw, serveReq, cw.reval, cw.next, "hit")
 
 		return
@@ -115,6 +119,9 @@ func (cw *captureWriter) decide(status int) {
 	// (5xx is uncacheable anyway).
 	if cw.fallback != nil && status >= 500 && !cw.fallback.mustRevalidate.Load() {
 		cw.swallow = true
+		if ce := cw.fc.logger.Check(zap.DebugLevel, "upstream error; serving stale entry"); ce != nil {
+			ce.Write(zap.String("key", cw.fallback.key), zap.Int("status", status))
+		}
 		_ = cw.fc.serveEntry(cw.rw, serveReq, cw.fallback, cw.next,
 			"hit", "fwd=stale", "fwd-status="+strconv.Itoa(status))
 
@@ -128,6 +135,10 @@ func (cw *captureWriter) decide(status int) {
 	fresh, swr, varyH, mr, ok := responseCacheable(cw.ix, cw.req, status, cw.hdr)
 	if !ok || fresh <= 0 {
 		cw.missStatus()
+		if ce := cw.fc.logger.Check(zap.DebugLevel, "response not stored"); ce != nil {
+			ce.Write(zap.String("key", cw.base), zap.Int("status", status),
+				zap.Bool("cacheable", ok), zap.Duration("fresh", fresh))
+		}
 		return
 	}
 
@@ -147,6 +158,10 @@ func (cw *captureWriter) decide(status int) {
 		// and aborted by Write if they grow past the budget.
 		if cw.ix.memBudget <= 0 || cw.declared > cw.ix.memBudget {
 			cw.cacheable = false
+			if ce := cw.fc.logger.Check(zap.DebugLevel, "response not stored"); ce != nil {
+				ce.Write(zap.String("key", cw.base), zap.String("reason", "memory budget"),
+					zap.Int64("declared_size", cw.declared))
+			}
 
 			return
 		}
@@ -165,6 +180,8 @@ func (cw *captureWriter) decide(status int) {
 
 		if err := os.MkdirAll(filepath.Dir(cw.final), 0o750); err != nil {
 			cw.cacheable = false
+			cw.fc.logger.Warn("cannot create cache directory; response not stored",
+				zap.String("path", filepath.Dir(cw.final)), zap.Error(err))
 
 			return
 		}
@@ -172,6 +189,8 @@ func (cw *captureWriter) decide(status int) {
 		f, err := os.OpenFile(cw.tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
 		if err != nil {
 			cw.cacheable = false
+			cw.fc.logger.Warn("cannot create cache file; response not stored",
+				zap.String("path", cw.tmpPath), zap.Error(err))
 
 			return
 		}
@@ -296,6 +315,8 @@ func (cw *captureWriter) Write(b []byte) (int, error) {
 	if cw.tmp != nil {
 		if _, werr := cw.tmp.Write(b); werr != nil {
 			cw.failed = true
+			cw.fc.logger.Warn("cache file write failed; entry will not be stored",
+				zap.String("path", cw.tmpPath), zap.Error(werr))
 
 			return n, err
 		}
@@ -349,6 +370,23 @@ func (cw *captureWriter) Close(handlerErr error) {
 		cw.ix.purgeSeq.Load() != cw.purgeAt {
 		// A purge or unsafe-method invalidation raced this capture —
 		// committing now would resurrect just-purged content.
+		if ce := cw.fc.logger.Check(zap.DebugLevel, "discarding captured response"); ce != nil {
+			reason := "purge raced the capture"
+			switch {
+			case handlerErr != nil:
+				reason = "handler error"
+			case cw.failed:
+				reason = "write failed"
+			case cw.hijacked:
+				reason = "hijacked"
+			case cw.declared >= 0 && cw.declared != cw.bodySize:
+				reason = "size mismatch"
+			case cw.req.Context().Err() != nil:
+				reason = "request cancelled"
+			}
+			ce.Write(zap.String("key", cw.base), zap.String("reason", reason),
+				zap.Error(handlerErr), zap.Error(cw.req.Context().Err()))
+		}
 		if cw.tmpPath != "" {
 			_ = os.Remove(cw.tmpPath)
 		}
@@ -361,6 +399,8 @@ func (cw *captureWriter) Close(handlerErr error) {
 	if !cw.ix.ramOnly {
 		if err := os.Rename(cw.tmpPath, cw.final); err != nil {
 			_ = os.Remove(cw.tmpPath)
+			cw.fc.logger.Warn("cannot commit cache file; entry not stored",
+				zap.String("path", cw.final), zap.Error(err))
 
 			return
 		}
@@ -369,6 +409,8 @@ func (cw *captureWriter) Close(handlerErr error) {
 		mf, err := os.OpenFile(cw.metaPath+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
 		if err != nil {
 			_ = os.Remove(cw.final)
+			cw.fc.logger.Warn("cannot write meta sidecar; entry not stored",
+				zap.String("path", cw.metaPath), zap.Error(err))
 
 			return
 		}
@@ -379,6 +421,8 @@ func (cw *captureWriter) Close(handlerErr error) {
 		if err != nil {
 			_ = os.Remove(cw.final)
 			_ = os.Remove(cw.metaPath + ".tmp")
+			cw.fc.logger.Warn("cannot write meta sidecar; entry not stored",
+				zap.String("path", cw.metaPath), zap.Error(err))
 
 			return
 		}
@@ -386,6 +430,8 @@ func (cw *captureWriter) Close(handlerErr error) {
 		if err := os.Rename(cw.metaPath+".tmp", cw.metaPath); err != nil {
 			_ = os.Remove(cw.final)
 			_ = os.Remove(cw.metaPath + ".tmp")
+			cw.fc.logger.Warn("cannot commit meta sidecar; entry not stored",
+				zap.String("path", cw.metaPath), zap.Error(err))
 
 			return
 		}
