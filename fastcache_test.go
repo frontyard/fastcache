@@ -58,6 +58,7 @@ func newTestCache(t *testing.T, mutate func(*FastCache)) *FastCache {
 	fc.sie, _ = parseDuration(fc.StaleIfError, 0)
 	fc.statusTTL, _ = parseStatusTTLs(fc.StatusTTL)
 	fc.revalidateTimeout, _ = parseDuration(fc.RevalidateTimeout, 30*time.Second)
+	fc.lockTimeout, _ = parseDuration(fc.LockTimeout, 30*time.Second)
 
 	fc.idx = newIndex(fc)
 	if err := fc.idx.rebuild(); err != nil {
@@ -1550,6 +1551,264 @@ func TestFollowerCancel(t *testing.T) {
 
 	close(release)
 	<-leaderDone // the leader's commit writes files into the TempDir — join it before teardown
+}
+
+// assertNoFlights fails the test if any flight records leaked.
+func assertNoFlights(t *testing.T, fc *FastCache) {
+	t.Helper()
+	fc.flights.Range(func(k, _ any) bool {
+		t.Errorf("leaked flight %v", k)
+		return true
+	})
+}
+
+// TestLeaderPanicReleasesFlight — the production wedge: reverse_proxy
+// panics http.ErrAbortHandler when a client disconnects mid-stream. The
+// panic unwinds through ServeHTTP; the flight must still be released or
+// every later request for the key parks on a channel that never closes.
+func TestLeaderPanicReleasesFlight(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		if n == 1 {
+			_, _ = w.Write([]byte("partial"))
+			cancel()                    // client disconnected mid-stream
+			panic(http.ErrAbortHandler) // reverse_proxy's response to the copy error
+		}
+		_, _ = w.Write([]byte("full"))
+
+		return nil
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil).WithContext(ctx)
+	func() {
+		defer func() {
+			if p := recover(); p != http.ErrAbortHandler {
+				t.Fatalf("expected ErrAbortHandler to propagate, got %v", p)
+			}
+		}()
+		_ = fc.ServeHTTP(httptest.NewRecorder(), r, next)
+	}()
+	assertNoFlights(t, fc)
+
+	// The panicked fill committed nothing: the same key re-fetches
+	// immediately instead of hanging.
+	w := get(t, fc, "/", nil, next)
+	if w.Body.String() != "full" {
+		t.Fatalf("expected re-fetched body, got %q", w.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 upstream calls, got %d", calls.Load())
+	}
+
+	// The re-fetch stored: the key is a normal entry again.
+	if w = get(t, fc, "/", nil, next); !strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+		t.Fatalf("expected stored entry after panic recovery, got %q", w.Header().Get("Cache-Status"))
+	}
+	assertNoFlights(t, fc)
+}
+
+// TestClientGoneMidFillCompletesStore: a fill is detached from its client —
+// canceling mid-body no longer kills it. The fill completes and stores so
+// coalesced followers hit the finished entry instead of re-filling.
+func TestClientGoneMidFillCompletesStore(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	midFill := make(chan struct{})
+	gate := make(chan struct{})
+
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = w.Write([]byte("first-"))
+		if n == 1 {
+			close(midFill)
+			<-gate
+		}
+		_, _ = w.Write([]byte("second"))
+
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil).WithContext(ctx)
+
+	done := make(chan error, 1)
+	go func() { done <- fc.ServeHTTP(httptest.NewRecorder(), r, next) }()
+
+	<-midFill
+	cancel()
+	time.Sleep(30 * time.Millisecond) // let the detach watcher swap the writer
+	close(gate)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("detached fill should complete cleanly, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader did not finish the detached fill")
+	}
+	assertNoFlights(t, fc)
+
+	// The fill completed without its client and committed: the next
+	// request is a hit, not a re-fill.
+	w := get(t, fc, "/", nil, next)
+	if w.Body.String() != "first-second" {
+		t.Fatalf("expected cached body, got %q", w.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected 1 upstream call (fill completed detached), got %d", calls.Load())
+	}
+}
+
+// TestCancelMidFillDoesNotWedgeKey — the production repro: a fill whose
+// client cancels mid-response must not permanently wedge the cache key.
+// When the abandoned fill dies (revalidate_timeout bounds the clientless
+// fetch), the next request must fetch and complete normally.
+func TestCancelMidFillDoesNotWedgeKey(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.RevalidateTimeout = "60ms" })
+
+	var calls atomic.Int64
+	midFill := make(chan struct{})
+
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		if n == 1 {
+			_, _ = w.Write([]byte("partial"))
+			close(midFill)
+			<-r.Context().Done() // abandoned once revalidate_timeout fires
+			return r.Context().Err()
+		}
+		_, _ = w.Write([]byte("full"))
+
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil).WithContext(ctx)
+
+	errc := make(chan error, 1)
+	go func() { errc <- fc.ServeHTTP(httptest.NewRecorder(), r, next) }()
+
+	<-midFill
+	cancel()
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("expected the abandoned fill to fail")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("abandoned fill did not end within revalidate_timeout")
+	}
+	assertNoFlights(t, fc)
+
+	// The canceled fill poisoned nothing: the same key fetches fresh and
+	// completes — before the fix this request hung forever.
+	w := get(t, fc, "/", nil, next)
+	if w.Body.String() != "full" {
+		t.Fatalf("expected re-fetched body, got %q", w.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 upstream calls, got %d", calls.Load())
+	}
+}
+
+// TestLockTimeoutFallback: a follower parked behind a stuck leader escapes
+// after lock_timeout and fetches upstream itself.
+func TestLockTimeoutFallback(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.LockTimeout = "50ms" })
+
+	var calls atomic.Int64
+	release := make(chan struct{})
+	leaderDone := make(chan struct{})
+	defer func() { close(release); <-leaderDone; assertNoFlights(t, fc) }()
+
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		n := calls.Add(1)
+		if n == 1 {
+			<-release // the leader's fill stays stuck
+		}
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = w.Write([]byte("body"))
+
+		return nil
+	})
+
+	go func() {
+		defer close(leaderDone)
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		_ = fc.ServeHTTP(httptest.NewRecorder(), r, next)
+	}()
+	waitFor(t, "leader in flight", func() bool { return calls.Load() == 1 })
+
+	// An unrelated key is unaffected by the stuck leader.
+	if w := get(t, fc, "/other", nil, next); w.Body.String() != "body" {
+		t.Fatalf("unrelated key blocked behind stuck leader: %q", w.Body.String())
+	}
+
+	// Parked behind the stuck leader, the follower must escape on
+	// lock_timeout and fetch upstream itself.
+	start := time.Now()
+	w := get(t, fc, "/", nil, next)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("follower waited %s on a stuck leader", elapsed)
+	}
+	if w.Body.String() != "body" {
+		t.Fatalf("expected direct fetch body, got %q", w.Body.String())
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("expected follower to fetch upstream itself, got %d calls", calls.Load())
+	}
+}
+
+// TestSIELockTimeout: a must-revalidate follower parked behind a stuck
+// revalidation escapes after lock_timeout and revalidates upstream itself.
+func TestSIELockTimeout(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) { fc.LockTimeout = "50ms" })
+
+	var calls atomic.Int64
+	release := make(chan struct{})
+	leaderDone := make(chan struct{})
+	defer func() { close(release); <-leaderDone; assertNoFlights(t, fc) }()
+
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=1, must-revalidate")
+		if n == 2 {
+			<-release // the coalesced revalidation stays stuck
+		}
+		_, _ = w.Write([]byte("v"))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(1100 * time.Millisecond)
+
+	go func() {
+		defer close(leaderDone)
+		get(t, fc, "/", nil, next)
+	}()
+	waitFor(t, "revalidation in flight", func() bool { return calls.Load() == 2 })
+
+	// must-revalidate forbids serving stale — the follower escapes the
+	// parked flight on lock_timeout and revalidates upstream itself.
+	w := get(t, fc, "/", nil, next)
+	if w.Body.String() != "v" {
+		t.Fatalf("expected revalidated body, got %q", w.Body.String())
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("expected follower to revalidate directly, got %d calls", calls.Load())
+	}
 }
 
 var _ = io.EOF
