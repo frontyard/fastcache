@@ -852,6 +852,7 @@ func (ix *index) rebuild() error {
 			ix.logger.Warn("dropping unreadable cache meta file",
 				zap.String("path", metaPath), zap.Error(err))
 			ix.removeFile(metaPath)
+			tracked[metaPath] = struct{}{} // accounted for — the orphan pass must not recount
 
 			continue
 		}
@@ -864,6 +865,7 @@ func (ix *index) rebuild() error {
 			ix.logger.Warn("cache body file missing; dropping meta sidecar",
 				zap.String("path", metaPath), zap.String("body", bodyPath), zap.Error(err))
 			ix.removeFile(metaPath)
+			tracked[metaPath] = struct{}{}
 
 			continue
 		}
@@ -872,6 +874,8 @@ func (ix *index) rebuild() error {
 			expired++
 			ix.removeFile(metaPath)
 			ix.removeFile(bodyPath)
+			tracked[metaPath] = struct{}{}
+			tracked[bodyPath] = struct{}{}
 
 			continue
 		}

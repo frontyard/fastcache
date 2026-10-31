@@ -28,6 +28,9 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type handlerFunc func(http.ResponseWriter, *http.Request) error
@@ -4327,5 +4330,370 @@ func TestStatusTTLCaddyfileErrors(t *testing.T) {
 				t.Errorf("%q should be an error", line)
 			}
 		})
+	}
+}
+
+// obsTestCache builds a test cache whose logger records every level into
+// an observer, so tests can assert the warnings/errors an operator sees.
+func obsTestCache(t *testing.T, mutate func(*FastCache)) (*FastCache, *observer.ObservedLogs) {
+	t.Helper()
+	core, observed := observer.New(zapcore.DebugLevel)
+
+	return newTestCache(t, func(fc *FastCache) {
+		fc.logger = zap.New(core)
+		if mutate != nil {
+			mutate(fc)
+		}
+	}), observed
+}
+
+// entryPath returns the on-disk body path of the cached entry for target.
+func entryPath(t *testing.T, fc *FastCache, target string) string {
+	t.Helper()
+
+	e, _, hit := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com"+target, nil))
+	if !hit {
+		t.Fatalf("no cached entry for %s", target)
+	}
+
+	return e.path
+}
+
+// TestStaleFallbackLogsWarn: upstream failures masked by a stale fallback
+// must surface as warnings — the served response looks like a plain hit.
+func TestStaleFallbackLogsWarn(t *testing.T) {
+	fc, logs := obsTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleIfError = "5s"
+	})
+
+	fail := 0 // 0 = ok, 1 = 5xx, 2 = handler error
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		switch fail {
+		case 1:
+			w.WriteHeader(http.StatusBadGateway)
+
+			return nil
+		case 2:
+			return errors.New("upstream dead")
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("v1"))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next) // stores v1
+	time.Sleep(80 * time.Millisecond)
+
+	fail = 1
+	if w := get(t, fc, "/", nil, next); w.Body.String() != "v1" {
+		t.Fatalf("expected stale fallback on 5xx, got %q", w.Body.String())
+	}
+	if logs.FilterMessage("upstream error; serving stale entry").Len() != 1 {
+		t.Fatalf("5xx masked by stale should warn, got %v", logs.All())
+	}
+
+	fail = 2
+	if w := get(t, fc, "/", nil, next); w.Body.String() != "v1" {
+		t.Fatalf("expected stale fallback on handler error, got %q", w.Body.String())
+	}
+	if logs.FilterMessage("revalidation failed; serving stale entry").Len() != 1 {
+		t.Fatalf("handler error masked by stale should warn, got %v", logs.All())
+	}
+}
+
+// TestBackgroundRevalidationLogsWarn: a failed detached refresh has no
+// caller to report to — the warn is the only trace of the upstream error.
+func TestBackgroundRevalidationLogsWarn(t *testing.T) {
+	fc, logs := obsTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleWhileRevalidate = "5s"
+	})
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		if calls.Add(1) > 1 {
+			return errors.New("upstream dead")
+		}
+
+		w.Header().Set("Cache-Control", "public")
+		_, _ = w.Write([]byte("v1"))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(80 * time.Millisecond)
+
+	// Inside the SWR window: stale served, background refresh errors out.
+	if w := get(t, fc, "/", nil, next); w.Body.String() != "v1" {
+		t.Fatalf("expected stale serve, got %q", w.Body.String())
+	}
+	waitFor(t, "background revalidation warn", func() bool {
+		return logs.FilterMessage("background revalidation failed").Len() == 1
+	})
+}
+
+// TestPurgeDeniedLogsWarn: a rejected PURGE is an audit event — silent
+// 403s would hide cache-invalidation probes.
+func TestPurgeDeniedLogsWarn(t *testing.T) {
+	fc, logs := obsTestCache(t, nil)
+
+	r := httptest.NewRequest("PURGE", "http://example.com/", nil)
+	r.RemoteAddr = "203.0.113.7:1234"
+	w := httptest.NewRecorder()
+
+	if err := fc.ServeHTTP(w, r, nil); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+	if logs.FilterMessage("PURGE denied").Len() != 1 {
+		t.Fatalf("denied PURGE should warn, got %v", logs.All())
+	}
+}
+
+// TestRebuildLogsDroppedFiles: rebuild reaping corrupt or tampered files
+// without a trace hides cache corruption — malformed metas and missing
+// bodies warn, and the summary reports everything it removed.
+func TestRebuildLogsDroppedFiles(t *testing.T) {
+	fc, logs := obsTestCache(t, nil)
+
+	shard := filepath.Join(fc.Path, "ab")
+	if err := os.MkdirAll(shard, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	putMeta := func(name string, m *metaHeader) {
+		t.Helper()
+		mf, err := os.OpenFile(filepath.Join(shard, name+".meta"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeMeta(mf, m); err != nil {
+			t.Fatal(err)
+		}
+		if err := mf.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Now().UnixNano()
+
+	// Garbage .meta → unreadable.
+	if err := os.WriteFile(filepath.Join(shard, "00112233445566778899aabb-1.meta"), []byte("junk"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	// Well-formed meta whose body is gone → tampered entry.
+	putMeta("112233445566778899aabbcc-2", &metaHeader{
+		Key: "example.com/gone", Status: 200,
+		StoredAt: now, ExpiresAt: now + int64(time.Hour), StaleAt: now + int64(time.Hour),
+	})
+
+	// Expired pair → counted, not warned.
+	body := filepath.Join(shard, "2233445566778899aabbccdd-3")
+	if err := os.WriteFile(body, []byte("x"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	putMeta("2233445566778899aabbccdd-3", &metaHeader{
+		Key: "example.com/old", Status: 200,
+		StoredAt: now - int64(2*time.Hour), ExpiresAt: now - int64(time.Hour), StaleAt: now - 1,
+	})
+
+	// Orphan in-flight body → counted.
+	if err := os.WriteFile(filepath.Join(shard, "33445566778899aabbccddee-4.tmp"), []byte("partial"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unreadable shard dir → subtree skipped, warned.
+	bad := filepath.Join(fc.Path, "cd")
+	if err := os.MkdirAll(bad, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bad, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(bad, 0o750) })
+
+	if err := fc.idx.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+
+	if logs.FilterMessage("dropping unreadable cache meta file").Len() != 1 {
+		t.Errorf("unreadable meta should warn, got %v", logs.All())
+	}
+	if logs.FilterMessage("cache body file missing; dropping meta sidecar").Len() != 1 {
+		t.Errorf("missing body should warn, got %v", logs.All())
+	}
+	if logs.FilterMessage("error scanning cache directory; subtree skipped").Len() != 1 {
+		t.Errorf("unreadable shard dir should warn, got %v", logs.All())
+	}
+
+	// The rebuild summary reports the reaped counts (this is the second
+	// rebuild — the first ran inside newTestCache).
+	infos := logs.FilterMessage("cache index rebuilt").All()
+	last := infos[len(infos)-1].ContextMap()
+	if last["expired"] != int64(1) || last["invalid"] != int64(2) || last["orphans"] != int64(1) {
+		t.Fatalf("rebuild summary counts wrong: %v", last)
+	}
+}
+
+// TestBodyFileErrorsLog: a vanished body is the benign eviction race
+// (debug); an unreadable one is an anomaly (warn). Either way the entry
+// is dropped and refetched.
+func TestBodyFileErrorsLog(t *testing.T) {
+	fc, logs := obsTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, make([]byte, 32<<10), http.Header{"Cache-Control": {"public, max-age=3600"}})
+
+	get(t, fc, "/", nil, next)
+
+	bodyPath := entryPath(t, fc, "/")
+	if err := os.Chmod(bodyPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(bodyPath, 0o640) })
+
+	get(t, fc, "/", nil, next) // EACCES → warn + refetch
+	if logs.FilterMessage("cannot open cache body file; refetching upstream").Len() != 1 {
+		t.Fatalf("unreadable body should warn, got %v", logs.All())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected refetch, got %d calls", calls.Load())
+	}
+
+	// A file that vanished entirely is the benign eviction race — debug.
+	get(t, fc, "/two", nil, next)
+	if err := os.Remove(entryPath(t, fc, "/two")); err != nil {
+		t.Fatal(err)
+	}
+	get(t, fc, "/two", nil, next)
+	if logs.FilterMessage("cannot open cache body file; refetching upstream").Len() != 1 {
+		t.Fatalf("missing body should stay debug, got %v", logs.All())
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("expected 4 upstream calls, got %d", calls.Load())
+	}
+}
+
+// TestRemoveFileLogsWarn: removal failures are reported — a file that
+// cannot be deleted leaks space until the next rebuild. "Already gone" is
+// not an error.
+func TestRemoveFileLogsWarn(t *testing.T) {
+	fc, logs := obsTestCache(t, nil)
+
+	nonempty := t.TempDir()
+	if err := os.WriteFile(filepath.Join(nonempty, "f"), []byte("x"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	fc.idx.removeFile(nonempty) // ENOTEMPTY
+	if logs.FilterMessage("cannot remove cache file").Len() != 1 {
+		t.Fatalf("failed remove should warn, got %v", logs.All())
+	}
+
+	fc.idx.removeFile(filepath.Join(nonempty, "does-not-exist"))
+	if logs.FilterMessage("cannot remove cache file").Len() != 1 {
+		t.Fatalf("missing file should not warn, got %v", logs.All())
+	}
+}
+
+// TestStoreDirUnwritableLogsWarn: an uncreatable shard dir degrades to a
+// passthrough — the response still serves, the warn explains why nothing
+// is stored.
+func TestStoreDirUnwritableLogsWarn(t *testing.T) {
+	fc, logs := obsTestCache(t, nil)
+
+	if err := os.Chmod(fc.Path, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(fc.Path, 0o750) })
+
+	var calls atomic.Int64
+	next := countingUpstream(&calls, []byte("x"), http.Header{"Cache-Control": {"public, max-age=3600"}})
+	if w := get(t, fc, "/", nil, next); w.Code != http.StatusOK {
+		t.Fatalf("response should still be served, got %d", w.Code)
+	}
+	if logs.FilterMessage("cannot create cache directory; response not stored").Len() != 1 {
+		t.Fatalf("unwritable cache dir should warn, got %v", logs.All())
+	}
+}
+
+// TestAbandonedFillLogsWarn: a detached fill that outlives
+// revalidate_timeout is dropped — the warn records the discarded work.
+func TestAbandonedFillLogsWarn(t *testing.T) {
+	fc, logs := obsTestCache(t, func(fc *FastCache) { fc.RevalidateTimeout = "60ms" })
+
+	midFill := make(chan struct{})
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = w.Write([]byte("partial"))
+		close(midFill)
+		<-r.Context().Done() // abandoned once revalidate_timeout fires
+
+		return r.Context().Err()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil).WithContext(ctx)
+	done := make(chan error, 1)
+	go func() { done <- fc.ServeHTTP(httptest.NewRecorder(), r, next) }()
+
+	<-midFill
+	cancel()
+
+	if err := <-done; err == nil {
+		t.Fatal("expected the abandoned fill to fail")
+	}
+	waitFor(t, "abandoned fill warn", func() bool {
+		return logs.FilterMessage("abandoning detached fill; revalidate_timeout exceeded").Len() == 1
+	})
+	assertNoFlights(t, fc)
+}
+
+// TestPersistMetaLogsWarn: a meta sidecar that cannot be rewritten after a
+// 304 merge warns — the entry stays servable but the update is lost.
+func TestPersistMetaLogsWarn(t *testing.T) {
+	fc, logs := obsTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleIfError = "5s"
+	})
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.Header().Set("Cache-Control", "public, max-age=60")
+			w.WriteHeader(http.StatusNotModified)
+
+			return nil
+		}
+
+		w.Header().Set("Cache-Control", "public")
+		w.Header().Set("ETag", `"v1"`)
+		_, _ = w.Write([]byte("v1"))
+
+		return nil
+	})
+
+	get(t, fc, "/", nil, next) // stores with ETag, freshness = 50ms ttl
+
+	// Read-only shard dir: the body still opens, the meta rewrite fails.
+	shard := filepath.Dir(entryPath(t, fc, "/"))
+	if err := os.Chmod(shard, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(shard, 0o750) })
+
+	time.Sleep(80 * time.Millisecond)
+	if w := get(t, fc, "/", nil, next); w.Body.String() != "v1" {
+		t.Fatalf("304 merge should serve the stored body, got %q", w.Body.String())
+	}
+	if logs.FilterMessage("cannot write meta sidecar").Len() != 1 {
+		t.Fatalf("failed meta rewrite should warn, got %v", logs.All())
 	}
 }
