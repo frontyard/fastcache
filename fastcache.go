@@ -567,6 +567,21 @@ func (fc *FastCache) refresh(e *entry, r *http.Request, next caddyhttp.Handler) 
 	if fc.revalidateTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, fc.revalidateTimeout)
 	}
+
+	// The request-scoped vars map is not safe for concurrent use, and the
+	// goroutine re-enters handlers that write to it (reverse_proxy's
+	// SetVar, matcher errors) while the caller's request is still being
+	// read — access logging calls GetVar on every request. Sharing the
+	// map is a fatal "concurrent map read and map write", so the
+	// background request gets a clone. The read happens here, before the
+	// goroutine, while this goroutine still owns the caller's map.
+	vars, _ := r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any)
+	if vars != nil {
+		vars = maps.Clone(vars)
+	} else {
+		vars = make(map[string]any)
+	}
+	ctx = context.WithValue(ctx, caddyhttp.VarsCtxKey, vars)
 	req = req.WithContext(ctx)
 
 	go func() {
