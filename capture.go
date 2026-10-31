@@ -133,7 +133,11 @@ func (cw *captureWriter) decide(status int) {
 		if ce := cw.fc.logger.Check(zap.DebugLevel, "revalidated entry via 304 merge"); ce != nil {
 			ce.Write(zap.String("key", cw.reval.key))
 		}
-		_ = cw.fc.serveEntry(cw.writer(), serveReq, cw.reval, cw.next, "hit")
+		if serr := cw.fc.serveEntry(cw.writer(), serveReq, cw.reval, cw.next, "hit"); serr != nil {
+			if ce := cw.fc.logger.Check(zap.DebugLevel, "cannot serve revalidated entry"); ce != nil {
+				ce.Write(zap.String("key", cw.reval.key), zap.Error(serr))
+			}
+		}
 
 		return
 	}
@@ -144,11 +148,14 @@ func (cw *captureWriter) decide(status int) {
 	// (5xx is uncacheable anyway).
 	if cw.fallback != nil && status >= 500 && !cw.fallback.mustRevalidate.Load() {
 		cw.swallow = true
-		if ce := cw.fc.logger.Check(zap.DebugLevel, "upstream error; serving stale entry"); ce != nil {
-			ce.Write(zap.String("key", cw.fallback.key), zap.Int("status", status))
+		cw.fc.logger.Warn("upstream error; serving stale entry",
+			zap.String("key", cw.fallback.key), zap.Int("status", status))
+		if serr := cw.fc.serveEntry(cw.writer(), serveReq, cw.fallback, cw.next,
+			"hit", "fwd=stale", "fwd-status="+strconv.Itoa(status)); serr != nil {
+			if ce := cw.fc.logger.Check(zap.DebugLevel, "cannot serve stale fallback"); ce != nil {
+				ce.Write(zap.String("key", cw.fallback.key), zap.Error(serr))
+			}
 		}
-		_ = cw.fc.serveEntry(cw.writer(), serveReq, cw.fallback, cw.next,
-			"hit", "fwd=stale", "fwd-status="+strconv.Itoa(status))
 
 		return
 	}
@@ -386,7 +393,13 @@ func (cw *captureWriter) Close(handlerErr error) {
 	}
 
 	if cw.tmp != nil {
-		_ = cw.tmp.Close()
+		// A failed close can surface deferred write errors (NFS, quota at
+		// flush): never commit a body whose final flush did not succeed.
+		if cerr := cw.tmp.Close(); cerr != nil {
+			cw.failed = true
+			cw.fc.logger.Warn("cannot close cache file; entry will not be stored",
+				zap.String("path", cw.tmpPath), zap.Error(cerr))
+		}
 	}
 
 	if handlerErr != nil || cw.failed || cw.hijacked ||
@@ -413,7 +426,7 @@ func (cw *captureWriter) Close(handlerErr error) {
 				zap.Error(handlerErr), zap.Error(cw.req.Context().Err()))
 		}
 		if cw.tmpPath != "" {
-			_ = os.Remove(cw.tmpPath)
+			cw.ix.removeFile(cw.tmpPath)
 		}
 
 		return
@@ -423,7 +436,7 @@ func (cw *captureWriter) Close(handlerErr error) {
 
 	if !cw.ix.ramOnly {
 		if err := os.Rename(cw.tmpPath, cw.final); err != nil {
-			_ = os.Remove(cw.tmpPath)
+			cw.ix.removeFile(cw.tmpPath)
 			cw.fc.logger.Warn("cannot commit cache file; entry not stored",
 				zap.String("path", cw.final), zap.Error(err))
 
@@ -433,7 +446,7 @@ func (cw *captureWriter) Close(handlerErr error) {
 		// Meta sidecar goes in last — its presence marks a complete entry.
 		mf, err := os.OpenFile(cw.metaPath+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
 		if err != nil {
-			_ = os.Remove(cw.final)
+			cw.ix.removeFile(cw.final)
 			cw.fc.logger.Warn("cannot write meta sidecar; entry not stored",
 				zap.String("path", cw.metaPath), zap.Error(err))
 
@@ -441,11 +454,13 @@ func (cw *captureWriter) Close(handlerErr error) {
 		}
 
 		metaSize, err = writeMeta(mf, cw.meta)
-		_ = mf.Close()
+		if cerr := mf.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
 
 		if err != nil {
-			_ = os.Remove(cw.final)
-			_ = os.Remove(cw.metaPath + ".tmp")
+			cw.ix.removeFile(cw.final)
+			cw.ix.removeFile(cw.metaPath + ".tmp")
 			cw.fc.logger.Warn("cannot write meta sidecar; entry not stored",
 				zap.String("path", cw.metaPath), zap.Error(err))
 
@@ -453,8 +468,8 @@ func (cw *captureWriter) Close(handlerErr error) {
 		}
 
 		if err := os.Rename(cw.metaPath+".tmp", cw.metaPath); err != nil {
-			_ = os.Remove(cw.final)
-			_ = os.Remove(cw.metaPath + ".tmp")
+			cw.ix.removeFile(cw.final)
+			cw.ix.removeFile(cw.metaPath + ".tmp")
 			cw.fc.logger.Warn("cannot commit meta sidecar; entry not stored",
 				zap.String("path", cw.metaPath), zap.Error(err))
 

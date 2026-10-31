@@ -407,10 +407,20 @@ func (ix *index) dropFile(e *entry) {
 	}
 
 	if e.path != "" {
-		_ = os.Remove(e.path)
+		ix.removeFile(e.path)
 	}
 	if e.metaPath != "" {
-		_ = os.Remove(e.metaPath)
+		ix.removeFile(e.metaPath)
+	}
+}
+
+// removeFile deletes p, warning on failures other than "already gone" —
+// a file we cannot remove leaks disk space invisibly until the next
+// rebuild (and a persistently failing remove means something is wrong
+// with the cache directory itself).
+func (ix *index) removeFile(p string) {
+	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		ix.logger.Warn("cannot remove cache file", zap.String("path", p), zap.Error(err))
 	}
 }
 
@@ -663,9 +673,8 @@ func (ix *index) openBody(e *entry) (*os.File, func(), error) {
 			// The serve consumed f, so read from offset 0 explicitly (pread).
 			data := make([]byte, e.size)
 			if _, rerr := io.ReadFull(io.NewSectionReader(f, 0, e.size), data); rerr != nil {
-				if ce := ix.logger.Check(zap.DebugLevel, "RAM promotion read failed"); ce != nil {
-					ce.Write(zap.String("key", e.key), zap.Error(rerr))
-				}
+				ix.logger.Warn("cannot read cache body for RAM promotion",
+					zap.String("key", e.key), zap.String("path", e.path), zap.Error(rerr))
 
 				return
 			}
@@ -788,6 +797,11 @@ func (ix *index) rebuild() error {
 
 	err := filepath.WalkDir(ix.dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// A walk error means part of the tree went unscanned; the
+			// index may come up incomplete, so make the gap visible.
+			ix.logger.Warn("error scanning cache directory; subtree skipped",
+				zap.String("path", p), zap.Error(err))
+
 			return nil
 		}
 		if d.IsDir() {
@@ -821,6 +835,7 @@ func (ix *index) rebuild() error {
 	now := time.Now().UnixNano()
 	tracked := map[string]struct{}{}
 	seen := map[string]struct{}{}
+	var expired, invalid, orphans int
 
 	for _, metaPath := range metas {
 		// RAM-only mode loads nothing; the orphan pass below removes any
@@ -833,21 +848,30 @@ func (ix *index) rebuild() error {
 
 		m, metaSize, err := readMeta(metaPath)
 		if err != nil {
-			_ = os.Remove(metaPath)
+			invalid++
+			ix.logger.Warn("dropping unreadable cache meta file",
+				zap.String("path", metaPath), zap.Error(err))
+			ix.removeFile(metaPath)
 
 			continue
 		}
 
 		info, err := os.Stat(bodyPath)
 		if err != nil {
-			_ = os.Remove(metaPath)
+			// The meta commits last at store time, so a present meta with
+			// a missing body means the entry was tampered with.
+			invalid++
+			ix.logger.Warn("cache body file missing; dropping meta sidecar",
+				zap.String("path", metaPath), zap.String("body", bodyPath), zap.Error(err))
+			ix.removeFile(metaPath)
 
 			continue
 		}
 
 		if now > m.StaleAt {
-			_ = os.Remove(metaPath)
-			_ = os.Remove(bodyPath)
+			expired++
+			ix.removeFile(metaPath)
+			ix.removeFile(bodyPath)
 
 			continue
 		}
@@ -915,7 +939,8 @@ func (ix *index) rebuild() error {
 	// alone (Remove also fails harmlessly on non-empty dirs).
 	for _, p := range allFiles {
 		if _, ok := tracked[p]; !ok && cacheFileRe.MatchString(filepath.Base(p)) {
-			_ = os.Remove(p)
+			orphans++
+			ix.removeFile(p)
 		}
 	}
 	for _, d := range dirs {
@@ -930,7 +955,10 @@ func (ix *index) rebuild() error {
 
 	ix.logger.Info("cache index rebuilt",
 		zap.Int("entries", int(ix.fileCount.Load())),
-		zap.Int64("disk_size", ix.diskSize.Load()))
+		zap.Int64("disk_size", ix.diskSize.Load()),
+		zap.Int("expired", expired),
+		zap.Int("invalid", invalid),
+		zap.Int("orphans", orphans))
 
 	return nil
 }
@@ -984,23 +1012,25 @@ func (ix *index) persistMeta(e *entry) {
 	}
 
 	_, werr := writeMeta(mf, e.meta())
-	_ = mf.Close()
+	if cerr := mf.Close(); cerr != nil && werr == nil {
+		werr = cerr
+	}
 
 	if werr != nil {
 		ix.logger.Warn("cannot write meta sidecar", zap.String("path", tmp), zap.Error(werr))
-		_ = os.Remove(tmp)
+		ix.removeFile(tmp)
 		return
 	}
 
 	if err := os.Rename(tmp, e.metaPath); err != nil {
 		ix.logger.Warn("cannot commit meta sidecar", zap.String("path", e.metaPath), zap.Error(err))
-		_ = os.Remove(tmp)
+		ix.removeFile(tmp)
 		return
 	}
 
 	// Lost a delete race between the check and the rename: take it down.
 	if v, ok := ix.entries.Load(e.key); !ok || v != e {
-		_ = os.Remove(e.metaPath)
+		ix.removeFile(e.metaPath)
 	}
 }
 

@@ -8,8 +8,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net"
 	"net/http"
@@ -150,7 +152,7 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 	}
 
 	if err = os.MkdirAll(fc.Path, 0o750); err != nil {
-		return err
+		return fmt.Errorf("creating cache directory %s: %w", fc.Path, err)
 	}
 
 	fc.idx = newIndex(fc)
@@ -515,9 +517,8 @@ func (fc *FastCache) detachFill(cw *captureWriter) (*http.Request, func()) {
 			case <-t.C:
 				cancel()
 				fc.idx.metrics.fev("abandoned")
-				if ce := fc.logger.Check(zap.DebugLevel, "abandoning detached fill"); ce != nil {
-					ce.Write(zap.String("key", cw.base), zap.Duration("timeout", fc.revalidateTimeout))
-				}
+				fc.logger.Warn("abandoning detached fill; revalidate_timeout exceeded",
+					zap.String("key", cw.base), zap.Duration("timeout", fc.revalidateTimeout))
 			}
 		case <-done:
 		}
@@ -556,10 +557,10 @@ func (fc *FastCache) revalidateOrStale(w http.ResponseWriter, r *http.Request, e
 	cw.ownVal = canMerge304(r, e)
 
 	if err = fc.runFill(cw, next); err != nil && !cw.wrote && !cw.swallow && !e.mustRevalidate.Load() {
-		// The handler failed before anything reached the client.
-		if ce := fc.logger.Check(zap.DebugLevel, "revalidation failed; serving stale entry"); ce != nil {
-			ce.Write(zap.String("key", e.key), zap.Error(err))
-		}
+		// The handler failed before anything reached the client — the
+		// error is masked by the stale fallback, so log it here.
+		fc.logger.Warn("revalidation failed; serving stale entry",
+			zap.String("key", e.key), zap.Error(err))
 
 		return fc.serveEntry(cw.writer(), r, e, next, "hit", "fwd=stale")
 	}
@@ -718,9 +719,9 @@ func (fc *FastCache) refresh(e *entry, r *http.Request, next caddyhttp.Handler) 
 
 		err := next.ServeHTTP(cw, req)
 		if err != nil {
-			if ce := fc.logger.Check(zap.DebugLevel, "background revalidation failed"); ce != nil {
-				ce.Write(zap.String("key", e.key), zap.Error(err))
-			}
+			// Runs detached — nobody else sees this failure.
+			fc.logger.Warn("background revalidation failed",
+				zap.String("key", e.key), zap.Error(err))
 		}
 		cw.Close(err)
 	}()
@@ -811,9 +812,17 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 		var err error
 
 		if f, done, err = fc.idx.openBody(e); err != nil {
-			// File vanished under us — drop the index entry and go upstream.
-			if ce := fc.logger.Check(zap.DebugLevel, "body file missing; dropping entry and refetching"); ce != nil {
-				ce.Write(zap.String("key", e.key), zap.String("path", e.path), zap.Error(err))
+			if errors.Is(err, fs.ErrNotExist) {
+				// File vanished under us (a concurrent eviction or purge
+				// deleted it) — drop the index entry and go upstream.
+				if ce := fc.logger.Check(zap.DebugLevel, "body file missing; dropping entry and refetching"); ce != nil {
+					ce.Write(zap.String("key", e.key), zap.String("path", e.path), zap.Error(err))
+				}
+			} else {
+				// The file is indexed but cannot be opened (permissions,
+				// disk error) — degraded rather than lost, but not normal.
+				fc.logger.Warn("cannot open cache body file; refetching upstream",
+					zap.String("key", e.key), zap.String("path", e.path), zap.Error(err))
 			}
 			fc.idx.deleteEntry(e)
 
@@ -979,9 +988,8 @@ func (fc *FastCache) purgeAllowed(r *http.Request) bool {
 
 func (fc *FastCache) handlePurge(w http.ResponseWriter, r *http.Request) error {
 	if !fc.purgeAllowed(r) {
-		if ce := fc.logger.Check(zap.DebugLevel, "PURGE denied"); ce != nil {
-			ce.Write(zap.String("remote", r.RemoteAddr), zap.String("key", fc.idx.baseKey(r)))
-		}
+		fc.logger.Warn("PURGE denied",
+			zap.String("remote", r.RemoteAddr), zap.String("key", fc.idx.baseKey(r)))
 		w.Header().Set("Cache-Status", "fastcache; fwd=request; detail=purge-denied")
 		w.WriteHeader(http.StatusForbidden)
 
