@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -71,7 +72,6 @@ type entry struct {
 	seq            atomic.Uint64 // last-use UnixNano, coarse (see touchGranularity)
 	promoting      atomic.Bool   // a disk hit is currently loading the body into RAM
 	dropped        atomic.Bool   // files/accounting already released (dropFile is idempotent)
-	metaQueued     atomic.Bool   // a meta sidecar rewrite is queued or in flight (queueMeta)
 }
 
 // meta serializes the entry's current state into a sidecar header.
@@ -181,7 +181,6 @@ type index struct {
 	mappingMu sync.Mutex
 	evictMu   sync.Mutex
 	evictCh   chan struct{} // 1-slot wakeup for evictLoop; sends coalesce
-	metaCh    chan *entry   // meta sidecar rewrites for evictLoop to drain (queueMeta)
 	sweepStop chan struct{}
 	stopOnce  sync.Once
 	workers   sync.WaitGroup // evictLoop + sweep; stop() joins them
@@ -223,7 +222,6 @@ func newIndex(cfg *FastCache) *index {
 			return m
 		}(),
 		evictCh:   make(chan struct{}, 1),
-		metaCh:    make(chan *entry, 1024),
 		sweepStop: make(chan struct{}),
 		metrics:   newCacheMetrics(cfg.Name),
 		logger:    cfg.logger,
@@ -472,23 +470,9 @@ func (ix *index) sweep() {
 	}
 }
 
-// drainMeta flushes queued meta sidecar writes on shutdown so the last
-// refreshes still persist. Runs on evictLoop after sweepStop fires.
-func (ix *index) drainMeta() {
-	for {
-		select {
-		case e := <-ix.metaCh:
-			e.metaQueued.Store(false)
-			ix.persistMeta(e)
-		default:
-			return
-		}
-	}
-}
-
 // stop halts the background workers and waits for them to exit — callers
 // tearing the module down (or removing the storage tree) need the last
-// meta write and expired-file reap to have completed.
+// expired-file reap and eviction pass to have completed.
 func (ix *index) stop() {
 	ix.stopOnce.Do(func() {
 		close(ix.sweepStop)
@@ -552,22 +536,12 @@ func (ix *index) maybeEvict() {
 // evictLoop performs budget enforcement on a dedicated goroutine. Woken by
 // maybeEvict, it reaps expired entries and scans the index once per wakeup,
 // freeing each budget to its low-water mark. Budgets may overshoot
-// transiently between the signal and the scan. It also drains the metaCh
-// queue: meta sidecar rewrites queued by queueMeta run here, off the
-// request path.
+// transiently between the signal and the scan.
 func (ix *index) evictLoop() {
 	for {
 		select {
 		case <-ix.sweepStop:
-			ix.drainMeta()
 			return
-		case e := <-ix.metaCh:
-			// Clear the flag before the write: a refresh landing while the
-			// write is in flight re-queues, and the follow-up write persists
-			// the newer state. Clearing after would lose it.
-			e.metaQueued.Store(false)
-			ix.persistMeta(e)
-			continue
 		case <-ix.evictCh:
 		}
 
@@ -898,12 +872,61 @@ func (ix *index) rebuild() error {
 		return err
 	}
 
+	// Scan phase: readMeta + body stat are ~30µs of I/O per entry, which
+	// dominates a large rebuild. Run them on a worker pool and apply the
+	// results sequentially below — ordering-sensitive bookkeeping (first-wins
+	// dedup, tracked/seen sets, warn order) stays deterministic.
+	type scanResult struct {
+		m        *metaHeader
+		metaSize int64
+		bodySize int64
+		bodyOK   bool
+		metaErr  error
+		bodyErr  error
+	}
+
+	results := make([]scanResult, len(metas))
+
+	if !ix.ramOnly {
+		var next atomic.Int64
+		var wg sync.WaitGroup
+
+		for range max(1, min(len(metas), 4*runtime.GOMAXPROCS(0))) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				for i := int(next.Add(1)) - 1; i < len(metas); i = int(next.Add(1)) - 1 {
+					metaPath := metas[i]
+					m, ms, err := readMeta(metaPath)
+					results[i].m, results[i].metaSize = m, ms
+					if err != nil {
+						results[i].metaErr = err
+
+						continue
+					}
+
+					info, err := os.Stat(strings.TrimSuffix(metaPath, ".meta"))
+					if err != nil {
+						results[i].bodyErr = err
+
+						continue
+					}
+
+					results[i].bodySize, results[i].bodyOK = info.Size(), true
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
 	now := time.Now().UnixNano()
 	tracked := map[string]struct{}{}
 	seen := map[string]struct{}{}
 	var expired, invalid, orphans int
+	var pending []expiryItem
 
-	for _, metaPath := range metas {
+	for i, metaPath := range metas {
 		// RAM-only mode loads nothing; the orphan pass below removes any
 		// files left over from a previous disk-backed configuration.
 		if ix.ramOnly {
@@ -911,25 +934,25 @@ func (ix *index) rebuild() error {
 		}
 
 		bodyPath := strings.TrimSuffix(metaPath, ".meta")
+		res := &results[i]
+		m, metaSize := res.m, res.metaSize
 
-		m, metaSize, err := readMeta(metaPath)
-		if err != nil {
+		if res.metaErr != nil {
 			invalid++
 			ix.logger.Warn("dropping unreadable cache meta file",
-				zap.String("path", metaPath), zap.Error(err))
+				zap.String("path", metaPath), zap.Error(res.metaErr))
 			ix.removeFile(metaPath)
 			tracked[metaPath] = struct{}{} // accounted for — the orphan pass must not recount
 
 			continue
 		}
 
-		info, err := os.Stat(bodyPath)
-		if err != nil {
+		if !res.bodyOK {
 			// The meta commits last at store time, so a present meta with
 			// a missing body means the entry was tampered with.
 			invalid++
 			ix.logger.Warn("cache body file missing; dropping meta sidecar",
-				zap.String("path", metaPath), zap.String("body", bodyPath), zap.Error(err))
+				zap.String("path", metaPath), zap.String("body", bodyPath), zap.Error(res.bodyErr))
 			ix.removeFile(metaPath)
 			tracked[metaPath] = struct{}{}
 
@@ -966,8 +989,8 @@ func (ix *index) rebuild() error {
 			varyK:    m.VaryKey,
 			path:     bodyPath,
 			metaPath: metaPath,
-			size:     info.Size(),
-			fileSize: info.Size() + metaSize,
+			size:     res.bodySize,
+			fileSize: res.bodySize + metaSize,
 			status:   m.Status,
 		}
 		e.headers.Store(&hdr)
@@ -980,7 +1003,7 @@ func (ix *index) rebuild() error {
 		ix.entries.Store(fullKey, e)
 		ix.diskSize.Add(e.fileSize)
 		ix.fileCount.Add(1)
-		ix.scheduleExpiry(e)
+		pending = append(pending, expiryItem{key: fullKey, staleAt: m.StaleAt})
 
 		// mapping.varyHeaders is immutable once published (lock-free readers
 		// depend on it): the first-loaded scheme wins, and a meta that
@@ -1003,6 +1026,12 @@ func (ix *index) rebuild() error {
 		tracked[metaPath] = struct{}{}
 		tracked[bodyPath] = struct{}{}
 	}
+
+	// One heapify beats n ordered pushes.
+	ix.heapMu.Lock()
+	ix.expQueue = append(ix.expQueue, pending...)
+	heap.Init(&ix.expQueue)
+	ix.heapMu.Unlock()
 
 	// Remove unreferenced fastcache files, then the now empty shard
 	// directories. Foreign files and directories under path are left
@@ -1035,8 +1064,8 @@ func (ix *index) rebuild() error {
 
 // refresh304 merges a 304 response into a stored entry (RFC 9111 §4.3.4):
 // the 304's header fields replace same-named stored fields, freshness
-// deadlines are recomputed, and the meta sidecar is queued for rewrite so
-// the update survives a restart. The body file is untouched.
+// deadlines are recomputed, and the meta sidecar is rewritten so the update
+// survives a restart. The body file is untouched.
 func (ix *index) refresh304(e *entry, h http.Header) {
 	old := *e.headers.Load()
 	merged := make(http.Header, len(old)+len(h))
@@ -1057,38 +1086,11 @@ func (ix *index) refresh304(e *entry, h http.Header) {
 	e.mustRevalidate.Store(mustRevalidate(responseCC(merged)))
 
 	ix.scheduleExpiry(e)
-	ix.queueMeta(e)
-}
-
-// queueMeta schedules an entry's meta sidecar rewrite on the evictLoop
-// worker. persistMeta is open+encode+write+rename — too slow to run on the
-// request path each time a 304 merge updates freshness. Writes coalesce via
-// metaQueued: while one write is queued or in flight, a further refresh just
-// lets the pending write capture the newer state (persistMeta snapshots the
-// atomics at write time). A saturated queue — a revalidation storm deeper
-// than the buffer — falls back to an inline write rather than drop the
-// update.
-func (ix *index) queueMeta(e *entry) {
-	if ix.ramOnly || e.metaPath == "" {
-		return
-	}
-
-	if !e.metaQueued.CompareAndSwap(false, true) {
-		return
-	}
-
-	select {
-	case ix.metaCh <- e:
-	default:
-		e.metaQueued.Store(false)
-		ix.persistMeta(e)
-	}
+	ix.persistMeta(e)
 }
 
 // persistMeta rewrites an entry's meta sidecar after an in-place update.
-// Runs on the evictLoop worker (queued via queueMeta); request-path callers
-// must not invoke it directly. No-op for RAM-only entries, and skipped
-// when the entry has meanwhile
+// No-op for RAM-only entries, and skipped when the entry has meanwhile
 // been purged or evicted — writing it back would resurrect an orphan
 // sidecar (rebuild would reap it, but not until the next restart).
 func (ix *index) persistMeta(e *entry) {

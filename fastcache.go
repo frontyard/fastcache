@@ -876,8 +876,15 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 		if body != nil {
 			_, _ = w.Write(*body)
 		} else {
-			// Copy picks up the ResponseWriter's ReadFrom → sendfile.
-			_, _ = io.Copy(w, f)
+			// fileNoWT hides f's WriteTo so the copy reaches w's ReadFrom
+			// directly — the same hop genericWriteTo performs, minus its
+			// private buffer. Sendfile still works: the conn's sendfile
+			// probe type-asserts the source to syscall.Conn, which the
+			// embedded *os.File keeps exposing. With no ReadFrom the
+			// pooled buffer avoids a fresh 32KB allocation per hit.
+			bufp := copyBufPool.Get().(*[]byte)
+			_, _ = io.CopyBuffer(w, fileNoWT{File: f}, *bufp)
+			copyBufPool.Put(bufp)
 		}
 
 		return nil
@@ -892,6 +899,26 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 	http.ServeContent(w, r, "", lastModified(e), rs)
 
 	return nil
+}
+
+// copyBufPool backs the non-sendfile body copy in serveEntry — see the
+// comment at its use.
+var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32<<10); return &b }}
+
+// noWriteTo shadows an embedded file's WriteTo — the same hiding trick as
+// os.fileWithoutWriteTo. It must never be invoked.
+type noWriteTo struct{}
+
+func (noWriteTo) WriteTo(io.Writer) (int64, error) { panic("can't happen") }
+
+// fileNoWT is *os.File minus its WriterTo: io.Copy checks src.WriterTo
+// first, and (*os.File).WriteTo only zero-copies to a raw network conn —
+// an http.ResponseWriter fails that probe, then falls back to a buffered
+// copy. Hiding WriteTo skips the probe so the destination's ReaderFrom
+// (which can sendfile from a file) is consulted instead.
+type fileNoWT struct {
+	noWriteTo
+	*os.File
 }
 
 // ttlParam is the Cache-Status ttl parameter: remaining freshness, seconds.
