@@ -1068,7 +1068,7 @@ func TestRefreshVarsIsolation(t *testing.T) {
 
 	// While the background write is in flight, hammer reads on the
 	// caller's map — what access logging does at request end.
-	for i := 0; i < 1e5; i++ {
+	for range 100000 {
 		_ = caddyhttp.GetVar(r2.Context(), caddyhttp.ClientIPVarKey)
 	}
 	close(release)
