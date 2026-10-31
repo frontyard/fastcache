@@ -111,7 +111,8 @@ into the cache while streaming it to the client.
 | `stale_while_revalidate`      | `0` (off)              | Serve an expired entry while one background refresh runs                                                                                                                                 |
 | `stale_if_error`              | `0` (off)              | Retain expired entries this long as upstream-failure fallback (see below)                                                                                                                |
 | `status_ttl`                  | none                   | Per-status freshness cap: `status_ttl <code>... <duration>` (repeatable); bounds even explicit upstream freshness — `0` disables storing that status                                   |
-| `revalidate_timeout`          | `30s`                  | Bound on any single upstream revalidation (`0` = unbounded)                                                                                                                              |
+| `revalidate_timeout`          | `30s`                  | Bound on any single upstream revalidation — and on a fill whose client went away (`0` = unbounded)                                                                                       |
+| `lock_timeout`                | `30s`                  | How long a coalesced request may wait on an in-flight fill/revalidation (nginx `proxy_cache_lock_timeout`); on expiry it fetches upstream itself (`0` = unbounded)                      |
 | `cache_key`                   | `{host}{requestURI}`   | Cache key as a caddy placeholder template, e.g. `{http.request.host}{http.request.uri.path}`                                                                                             |
 | `match_header`                | none                   | Store only responses whose header `<name>` equals one of the given values (repeatable)                                                                                                   |
 | `vary`                        | none                   | Whitelist of `Vary` header names to key on                                                                                                                                               |
@@ -302,6 +303,7 @@ localhost:2020 {
 | `fastcache_requests_total`      | counter | `name`, `result`: `hit` `stale` `miss` `bypass` `purged` `revalidated`   |
 | `fastcache_revalidations_total` | counter | `name`, `result`: `ok` `not_modified` (304 merge) `error`                |
 | `fastcache_evictions_total`     | counter | `name`, `reason`: `expired` `disk` `count` `memory` `purge` `invalidate` |
+| `fastcache_flight_events_total` | counter | `name`, `event`: `lock_timeout` (follower escaped a stuck leader) `detached` (fill outlived its client) `abandoned` (detached fill hit `revalidate_timeout`) |
 | `fastcache_entries`             | gauge   | `name`                                                                   |
 | `fastcache_bytes`               | gauge   | `name`, `tier`: `memory` `disk`                                          |
 
@@ -367,14 +369,23 @@ The hit path takes no locks:
   is promoted via `pread` from offset 0, with a `promoting` flag so only one
   concurrent hit does the read.
 - Misses are coalesced per key by a `flights` singleflight map; followers wait
-  on both completion and `r.Context()`, then loop — re-serving the new entry
-  or leading/following the next flight. Waits are capped (`maxFlightRounds`),
-  after which a request fetches itself — so concurrent upstream fetches stay
-  bounded even when leaders keep finishing without covering the request
-  (uncacheable responses under churn). Revalidations coalesce under a
-  separate `reval:` flight shared by background refresh and synchronous
-  revalidation: at most one upstream validation per variant is ever in
-  flight.
+  on completion, `r.Context()`, and `lock_timeout`, then loop — re-serving
+  the new entry or leading/following the next flight. Waits are capped
+  (`maxFlightRounds`), after which a request fetches itself — so concurrent
+  upstream fetches stay bounded even when leaders keep finishing without
+  covering the request (uncacheable responses under churn). Revalidations
+  coalesce under a separate `reval:` flight shared by background refresh and
+  synchronous revalidation: at most one upstream validation per variant is
+  ever in flight.
+- A leader always releases its flight — `finishFlight` is deferred, so a
+  handler panic (reverse_proxy's `panic(http.ErrAbortHandler)` on mid-stream
+  client loss), an upstream error, or a canceled context still wakes every
+  follower. Fills are also detached from the leader's client context: if the
+  client disconnects mid-fill the captureWriter swaps its downstream to a
+  discard sink and the fill completes and stores for the followers still
+  waiting, bounded by `revalidate_timeout` once clientless. And because
+  `lock_timeout` caps every follower wait, a stuck fill can never wedge a
+  key — the follower fetches upstream itself.
 
 ### Eviction and expiry
 
@@ -397,10 +408,12 @@ The hit path takes no locks:
 ### Correctness under failure
 
 `captureWriter` commits only complete responses: it discards on short/failed
-downstream `Write`, handler errors, request-context cancellation, body size
-mismatching the upstream `Content-Length`, and on any PURGE/invalidation that
-landed while the capture was still in flight — a truncated or superseded
-stream can never poison the cache.
+downstream `Write`, handler errors, a handler panic (the recover marks the
+capture failed before re-throwing — during unwinding the error return is
+still nil), request-context cancellation, body size mismatching the upstream
+`Content-Length`, and on any PURGE/invalidation that landed while the
+capture was still in flight — a truncated or superseded stream can never
+poison the cache.
 
 ## Benchmark results
 

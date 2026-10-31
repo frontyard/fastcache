@@ -8,8 +8,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net"
 	"net/http"
@@ -54,6 +56,7 @@ type FastCache struct {
 	PromoteBelow         string              `json:"promote_below,omitempty"`
 	StoreSetCookie       bool                `json:"store_set_cookie,omitempty"`
 	RevalidateTimeout    string              `json:"revalidate_timeout,omitempty"`
+	LockTimeout          string              `json:"lock_timeout,omitempty"`
 
 	memoryBytes       int64
 	diskBytes         int64
@@ -63,6 +66,7 @@ type FastCache struct {
 	sie               time.Duration
 	statusTTL         map[int]time.Duration
 	revalidateTimeout time.Duration
+	lockTimeout       time.Duration
 	purgeNets         []netip.Prefix
 
 	logger  *zap.Logger
@@ -120,6 +124,10 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("revalidate_timeout: %w", err)
 	}
 
+	if fc.lockTimeout, err = parseDuration(fc.LockTimeout, 30*time.Second); err != nil {
+		return fmt.Errorf("lock_timeout: %w", err)
+	}
+
 	for name, v := range map[string]int64{
 		"memory_size": fc.memoryBytes, "disk_size": fc.diskBytes, "promote_below": fc.promoteBelow,
 	} {
@@ -129,7 +137,7 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 	}
 	for name, v := range map[string]time.Duration{
 		"ttl": fc.ttl, "stale_while_revalidate": fc.swr, "stale_if_error": fc.sie,
-		"revalidate_timeout": fc.revalidateTimeout,
+		"revalidate_timeout": fc.revalidateTimeout, "lock_timeout": fc.lockTimeout,
 	} {
 		if v < 0 {
 			return fmt.Errorf("%s must be >= 0, got %s", name, v)
@@ -144,7 +152,7 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 	}
 
 	if err = os.MkdirAll(fc.Path, 0o750); err != nil {
-		return err
+		return fmt.Errorf("creating cache directory %s: %w", fc.Path, err)
 	}
 
 	fc.idx = newIndex(fc)
@@ -341,14 +349,16 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 			// followers immediately.
 			done, leader := fc.startFlight("reval:" + e.key)
 			if leader {
+				// Deferred so a handler panic (reverse_proxy panics
+				// http.ErrAbortHandler when the client disconnects
+				// mid-stream) still releases every waiter.
+				defer fc.finishFlight("reval:"+e.key, done)
 				fc.idx.metrics.req("revalidated")
 				if ce := fc.logger.Check(zap.DebugLevel, "revalidating stale entry"); ce != nil {
 					ce.Write(zap.String("key", e.key), zap.Bool("must_revalidate", mr))
 				}
-				err := fc.revalidateOrStale(w, r, e, next)
-				fc.finishFlight("reval:"+e.key, done)
 
-				return err
+				return fc.revalidateOrStale(w, r, e, next)
 			}
 
 			if !mr {
@@ -365,6 +375,15 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 			}
 			select {
 			case <-done:
+			case <-fc.lockTimeoutCh():
+				// The in-flight revalidation outlived lock_timeout —
+				// fetch upstream ourselves rather than stay parked.
+				fc.idx.metrics.fev("lock_timeout")
+				if ce := fc.logger.Check(zap.DebugLevel, "revalidation lock timeout; fetching upstream directly"); ce != nil {
+					ce.Write(zap.String("key", e.key))
+				}
+
+				return fc.revalidateOrStale(w, r, e, next)
 			case <-r.Context().Done():
 				return r.Context().Err()
 			}
@@ -380,14 +399,17 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 
 		done, leader := fc.startFlight(flightKey)
 		if leader {
+			// Deferred so a handler panic (reverse_proxy panics
+			// http.ErrAbortHandler when the client disconnects
+			// mid-stream) still releases every waiter — a leaked flight
+			// record parks followers on a channel that never closes.
+			defer fc.finishFlight(flightKey, done)
 			fc.idx.metrics.req("miss")
 			if ce := fc.logger.Check(zap.DebugLevel, "cache miss"); ce != nil {
 				ce.Write(zap.String("key", flightKey))
 			}
-			err := fc.fetchAndStore(w, r, base, next)
-			fc.finishFlight(flightKey, done)
 
-			return err
+			return fc.fetchAndStore(w, r, base, next)
 		}
 
 		if tries >= maxFlightRounds {
@@ -407,6 +429,17 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		}
 		select {
 		case <-done:
+		case <-fc.lockTimeoutCh():
+			// The leader's fill outlived lock_timeout — fetch upstream
+			// ourselves. The stuck flight is left for its leader; new
+			// followers may still coalesce behind it, but every request
+			// escapes the same way.
+			fc.idx.metrics.fev("lock_timeout")
+			if ce := fc.logger.Check(zap.DebugLevel, "lock timeout; fetching upstream directly"); ce != nil {
+				ce.Write(zap.String("key", flightKey))
+			}
+
+			return fc.fetchAndStore(w, r, base, next)
 		case <-r.Context().Done():
 			return r.Context().Err()
 		}
@@ -419,11 +452,91 @@ const maxFlightRounds = 3
 
 // fetchAndStore proxies to next through a captureWriter; a handler error
 // discards the capture.
-func (fc *FastCache) fetchAndStore(w http.ResponseWriter, r *http.Request, base string, next caddyhttp.Handler) (err error) {
-	cw := newCaptureWriter(fc, w, r, base)
-	defer func() { cw.Close(err) }()
+func (fc *FastCache) fetchAndStore(w http.ResponseWriter, r *http.Request, base string, next caddyhttp.Handler) error {
+	return fc.runFill(newCaptureWriter(fc, w, r, base), next)
+}
+
+// runFill executes next.ServeHTTP over cw and resolves the capture when it
+// returns. The fetch runs on a context detached from the client's (see
+// detachFill): one impatient client must not kill a fill that coalesced
+// followers are waiting on.
+//
+// A handler panic marks the capture failed before re-throwing — during
+// unwinding the named error return is still nil, so Close would otherwise
+// mistake a mid-panic partial body for a completed fill and commit it.
+// The panic must reach net/http: reverse_proxy panics http.ErrAbortHandler
+// on mid-stream client loss, which is how the connection aborts silently.
+func (fc *FastCache) runFill(cw *captureWriter, next caddyhttp.Handler) (err error) {
+	r, finish := fc.detachFill(cw)
+	defer finish()
+	defer func() {
+		if p := recover(); p != nil {
+			cw.failed = true
+			cw.Close(fmt.Errorf("upstream handler panicked: %v", p))
+			panic(p)
+		}
+		cw.Close(err)
+	}()
 
 	return next.ServeHTTP(cw, r)
+}
+
+// detachFill rewrites the capture's request onto a context decoupled from
+// the client's: cancellation no longer propagates into the upstream fetch.
+// A watcher waits on the original client context — when it fires, the
+// captureWriter detaches its downstream writer to a discard sink (failing
+// client writes can no longer abort the fill) and the fetch gets
+// revalidate_timeout to complete the store before it is abandoned.
+// Returns the request to hand to next and an idempotent finish func that
+// stops the watcher; run before cw.Close so the ctx state at Close still
+// reflects whether the fill lived or was abandoned.
+func (fc *FastCache) detachFill(cw *captureWriter) (*http.Request, func()) {
+	r := cw.req
+	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+	r2 := r.WithContext(ctx)
+	cw.req = r2
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-r.Context().Done():
+			cw.detach()
+			fc.idx.metrics.fev("detached")
+			if ce := fc.logger.Check(zap.DebugLevel, "client gone; completing fill detached"); ce != nil {
+				ce.Write(zap.String("key", cw.base))
+			}
+
+			if fc.revalidateTimeout <= 0 {
+				<-done
+				return
+			}
+			t := time.NewTimer(fc.revalidateTimeout)
+			defer t.Stop()
+			select {
+			case <-done:
+			case <-t.C:
+				cancel()
+				fc.idx.metrics.fev("abandoned")
+				fc.logger.Warn("abandoning detached fill; revalidate_timeout exceeded",
+					zap.String("key", cw.base), zap.Duration("timeout", fc.revalidateTimeout))
+			}
+		case <-done:
+		}
+	}()
+
+	var once sync.Once
+	return r2, func() { once.Do(func() { close(done); cancel() }) }
+}
+
+// lockTimeoutCh bounds a follower's wait on an in-flight flight — the
+// lock_timeout option. A nil channel (timeout disabled with 0) blocks in
+// the select forever, i.e. unbounded waiting.
+func (fc *FastCache) lockTimeoutCh() <-chan time.Time {
+	if fc.lockTimeout <= 0 {
+		return nil
+	}
+
+	return time.After(fc.lockTimeout)
 }
 
 // revalidateOrStale re-fetches synchronously while holding a stale entry
@@ -442,15 +555,14 @@ func (fc *FastCache) revalidateOrStale(w http.ResponseWriter, r *http.Request, e
 	cw.origReq = r
 	cw.next = next
 	cw.ownVal = canMerge304(r, e)
-	defer func() { cw.Close(err) }()
 
-	if err = next.ServeHTTP(cw, r2); err != nil && !cw.wrote && !cw.swallow && !e.mustRevalidate.Load() {
-		// The handler failed before anything reached the client.
-		if ce := fc.logger.Check(zap.DebugLevel, "revalidation failed; serving stale entry"); ce != nil {
-			ce.Write(zap.String("key", e.key), zap.Error(err))
-		}
+	if err = fc.runFill(cw, next); err != nil && !cw.wrote && !cw.swallow && !e.mustRevalidate.Load() {
+		// The handler failed before anything reached the client — the
+		// error is masked by the stale fallback, so log it here.
+		fc.logger.Warn("revalidation failed; serving stale entry",
+			zap.String("key", e.key), zap.Error(err))
 
-		return fc.serveEntry(w, r, e, next, "hit", "fwd=stale")
+		return fc.serveEntry(cw.writer(), r, e, next, "hit", "fwd=stale")
 	}
 
 	return err
@@ -585,19 +697,31 @@ func (fc *FastCache) refresh(e *entry, r *http.Request, next caddyhttp.Handler) 
 	req = req.WithContext(ctx)
 
 	go func() {
-		defer cancel()
-		defer fc.finishFlight(key, done)
-
 		cw := newCaptureWriter(fc, &discardRW{h: http.Header{}}, req, e.baseKey)
 		cw.reval = e
 		cw.next = next
 		cw.ownVal = ownVal
 
+		// A panicking handler in a detached goroutine would kill the whole
+		// process — drop the partial capture and log instead. Defers run
+		// LIFO, so finishFlight (declared last) releases waiters before
+		// this recover sees the panic.
+		defer func() {
+			if p := recover(); p != nil {
+				cw.failed = true
+				cw.Close(fmt.Errorf("upstream handler panicked: %v", p))
+				fc.logger.Error("background revalidation panicked",
+					zap.String("key", e.key), zap.Any("panic", p))
+			}
+		}()
+		defer cancel()
+		defer fc.finishFlight(key, done)
+
 		err := next.ServeHTTP(cw, req)
 		if err != nil {
-			if ce := fc.logger.Check(zap.DebugLevel, "background revalidation failed"); ce != nil {
-				ce.Write(zap.String("key", e.key), zap.Error(err))
-			}
+			// Runs detached — nobody else sees this failure.
+			fc.logger.Warn("background revalidation failed",
+				zap.String("key", e.key), zap.Error(err))
 		}
 		cw.Close(err)
 	}()
@@ -688,9 +812,17 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 		var err error
 
 		if f, done, err = fc.idx.openBody(e); err != nil {
-			// File vanished under us — drop the index entry and go upstream.
-			if ce := fc.logger.Check(zap.DebugLevel, "body file missing; dropping entry and refetching"); ce != nil {
-				ce.Write(zap.String("key", e.key), zap.String("path", e.path), zap.Error(err))
+			if errors.Is(err, fs.ErrNotExist) {
+				// File vanished under us (a concurrent eviction or purge
+				// deleted it) — drop the index entry and go upstream.
+				if ce := fc.logger.Check(zap.DebugLevel, "body file missing; dropping entry and refetching"); ce != nil {
+					ce.Write(zap.String("key", e.key), zap.String("path", e.path), zap.Error(err))
+				}
+			} else {
+				// The file is indexed but cannot be opened (permissions,
+				// disk error) — degraded rather than lost, but not normal.
+				fc.logger.Warn("cannot open cache body file; refetching upstream",
+					zap.String("key", e.key), zap.String("path", e.path), zap.Error(err))
 			}
 			fc.idx.deleteEntry(e)
 
@@ -856,9 +988,8 @@ func (fc *FastCache) purgeAllowed(r *http.Request) bool {
 
 func (fc *FastCache) handlePurge(w http.ResponseWriter, r *http.Request) error {
 	if !fc.purgeAllowed(r) {
-		if ce := fc.logger.Check(zap.DebugLevel, "PURGE denied"); ce != nil {
-			ce.Write(zap.String("remote", r.RemoteAddr), zap.String("key", fc.idx.baseKey(r)))
-		}
+		fc.logger.Warn("PURGE denied",
+			zap.String("remote", r.RemoteAddr), zap.String("key", fc.idx.baseKey(r)))
 		w.Header().Set("Cache-Status", "fastcache; fwd=request; detail=purge-denied")
 		w.WriteHeader(http.StatusForbidden)
 
@@ -1007,6 +1138,11 @@ func (fc *FastCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				fc.RevalidateTimeout = d.Val()
+			case "lock_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				fc.LockTimeout = d.Val()
 			default:
 				return d.Errf("unknown fastcache option %q", d.Val())
 			}

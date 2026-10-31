@@ -15,13 +15,15 @@ type cacheMetrics struct {
 	requests      *prometheus.CounterVec // result: hit|stale|miss|bypass|purged|revalidated
 	revalidations *prometheus.CounterVec // result: ok|not_modified|error
 	evictions     *prometheus.CounterVec // reason: expired|disk|count|memory|purge|invalidate
+	flights       *prometheus.CounterVec // event: lock_timeout|detached|abandoned
 
 	// Resolved child counters: WithLabelValues does a map lookup under a
 	// mutex per call — too expensive to run on every hit. resolve() rebuilds
 	// these after (re)registration.
-	reqC   map[string]prometheus.Counter
-	revalC map[string]prometheus.Counter
-	evictC map[string]prometheus.Counter
+	reqC    map[string]prometheus.Counter
+	revalC  map[string]prometheus.Counter
+	evictC  map[string]prometheus.Counter
+	flightC map[string]prometheus.Counter
 }
 
 func newCacheMetrics(name string) *cacheMetrics {
@@ -42,6 +44,11 @@ func newCacheMetrics(name string) *cacheMetrics {
 			Name:      "evictions_total",
 			Help:      "Entries removed from the index, by reason (expired, disk/count/memory budget, purge, invalidate).",
 		}, []string{"name", "reason"}),
+		flights: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "fastcache",
+			Name:      "flight_events_total",
+			Help:      "Miss-coalescing flight events, by kind (lock_timeout = follower escaped a stuck leader, detached = fill outlived its client, abandoned = detached fill hit revalidate_timeout).",
+		}, []string{"name", "event"}),
 	}
 
 	// Pre-create every label child so a scrape always shows the families,
@@ -69,11 +76,17 @@ func (m *cacheMetrics) resolve() {
 	for _, r := range []string{"expired", "disk", "count", "memory", "purge", "invalidate"} {
 		m.evictC[r] = m.evictions.WithLabelValues(m.name, r)
 	}
+
+	m.flightC = map[string]prometheus.Counter{}
+	for _, e := range []string{"lock_timeout", "detached", "abandoned"} {
+		m.flightC[e] = m.flights.WithLabelValues(m.name, e)
+	}
 }
 
 func (m *cacheMetrics) req(result string)   { m.reqC[result].Inc() }
 func (m *cacheMetrics) reval(result string) { m.revalC[result].Inc() }
 func (m *cacheMetrics) evict(reason string) { m.evictC[reason].Inc() }
+func (m *cacheMetrics) fev(event string)    { m.flightC[event].Inc() }
 
 // register attaches the collectors to the config's shared metrics registry.
 // Other FastCache instances reuse the already-registered counter vecs — the
@@ -83,6 +96,7 @@ func (m *cacheMetrics) register(reg *prometheus.Registry) {
 	m.requests = registerOrReuse(reg, m.requests)
 	m.revalidations = registerOrReuse(reg, m.revalidations)
 	m.evictions = registerOrReuse(reg, m.evictions)
+	m.flights = registerOrReuse(reg, m.flights)
 	m.resolve()
 
 	name := m.name

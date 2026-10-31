@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -17,8 +18,14 @@ import (
 // captureWriter wraps the downstream ResponseWriter on a miss. It streams
 // every byte to the client while teeing a cacheable body into a temp file;
 // on Close it commits the entry (header block + body, atomic rename).
+//
+// rwP is an atomic pointer because a fill may outlive its client: once the
+// request context is done, detach() swaps the downstream writer for a
+// discardRW — writes stop failing, so a handler streaming to a dead client
+// (reverse_proxy's panic(http.ErrAbortHandler) path) can't abort a fill
+// that coalesced followers are still waiting on.
 type captureWriter struct {
-	rw   http.ResponseWriter
+	rwP  atomic.Pointer[http.ResponseWriter]
 	ix   *index
 	fc   *FastCache
 	req  *http.Request
@@ -75,8 +82,26 @@ type captureWriter struct {
 }
 
 func newCaptureWriter(fc *FastCache, rw http.ResponseWriter, r *http.Request, base string) *captureWriter {
-	return &captureWriter{rw: rw, ix: fc.idx, fc: fc, req: r, base: base, status: http.StatusOK, declared: -1,
+	cw := &captureWriter{ix: fc.idx, fc: fc, req: r, base: base, status: http.StatusOK, declared: -1,
 		hdr: http.Header{}, purgeAt: fc.idx.purgeSeq.Load()}
+	cw.rwP.Store(&rw)
+
+	return cw
+}
+
+// writer returns the current downstream writer: the client's, or a discard
+// sink once detach() ran.
+func (cw *captureWriter) writer() http.ResponseWriter { return *cw.rwP.Load() }
+
+// detach swaps the downstream writer for a discard sink. The client is gone,
+// so bytes no longer need to reach it — but failing writes would abort the
+// upstream stream (caddy's reverse_proxy panics ErrAbortHandler on a copy
+// error) and kill a fill that waiting followers still need. A write already
+// in flight to the dead client may still fail and poison the capture, which
+// is safe: it is discarded on Close and followers retry as the next leader.
+func (cw *captureWriter) detach() {
+	var d http.ResponseWriter = &discardRW{h: http.Header{}}
+	cw.rwP.Store(&d)
 }
 
 // Header returns a private buffer, not the client's live header map: a
@@ -108,7 +133,11 @@ func (cw *captureWriter) decide(status int) {
 		if ce := cw.fc.logger.Check(zap.DebugLevel, "revalidated entry via 304 merge"); ce != nil {
 			ce.Write(zap.String("key", cw.reval.key))
 		}
-		_ = cw.fc.serveEntry(cw.rw, serveReq, cw.reval, cw.next, "hit")
+		if serr := cw.fc.serveEntry(cw.writer(), serveReq, cw.reval, cw.next, "hit"); serr != nil {
+			if ce := cw.fc.logger.Check(zap.DebugLevel, "cannot serve revalidated entry"); ce != nil {
+				ce.Write(zap.String("key", cw.reval.key), zap.Error(serr))
+			}
+		}
 
 		return
 	}
@@ -119,11 +148,14 @@ func (cw *captureWriter) decide(status int) {
 	// (5xx is uncacheable anyway).
 	if cw.fallback != nil && status >= 500 && !cw.fallback.mustRevalidate.Load() {
 		cw.swallow = true
-		if ce := cw.fc.logger.Check(zap.DebugLevel, "upstream error; serving stale entry"); ce != nil {
-			ce.Write(zap.String("key", cw.fallback.key), zap.Int("status", status))
+		cw.fc.logger.Warn("upstream error; serving stale entry",
+			zap.String("key", cw.fallback.key), zap.Int("status", status))
+		if serr := cw.fc.serveEntry(cw.writer(), serveReq, cw.fallback, cw.next,
+			"hit", "fwd=stale", "fwd-status="+strconv.Itoa(status)); serr != nil {
+			if ce := cw.fc.logger.Check(zap.DebugLevel, "cannot serve stale fallback"); ce != nil {
+				ce.Write(zap.String("key", cw.fallback.key), zap.Error(serr))
+			}
 		}
-		_ = cw.fc.serveEntry(cw.rw, serveReq, cw.fallback, cw.next,
-			"hit", "fwd=stale", "fwd-status="+strconv.Itoa(status))
 
 		return
 	}
@@ -242,7 +274,7 @@ func (cw *captureWriter) forwardHeaders() {
 			continue
 		}
 
-		cw.rw.Header()[k] = vv
+		cw.writer().Header()[k] = vv
 	}
 }
 
@@ -254,7 +286,7 @@ func (cw *captureWriter) missStatus() {
 		cs += "; stored; key=" + strconv.Quote(cw.base)
 	}
 
-	cw.rw.Header().Set("Cache-Status", cs)
+	cw.writer().Header().Set("Cache-Status", cs)
 }
 
 func (cw *captureWriter) key() string {
@@ -271,7 +303,7 @@ func (cw *captureWriter) WriteHeader(status int) {
 		// Informational response — flush its headers downstream and keep
 		// buffering for the final WriteHeader.
 		cw.forwardHeaders()
-		cw.rw.WriteHeader(status)
+		cw.writer().WriteHeader(status)
 
 		return
 	}
@@ -284,7 +316,7 @@ func (cw *captureWriter) WriteHeader(status int) {
 		return
 	}
 
-	cw.rw.WriteHeader(status)
+	cw.writer().WriteHeader(status)
 	cw.wrote = true
 }
 
@@ -297,7 +329,7 @@ func (cw *captureWriter) Write(b []byte) (int, error) {
 		return len(b), nil
 	}
 
-	n, err := cw.rw.Write(b)
+	n, err := cw.writer().Write(b)
 	cw.wrote = true
 
 	if !cw.cacheable || cw.failed {
@@ -361,7 +393,13 @@ func (cw *captureWriter) Close(handlerErr error) {
 	}
 
 	if cw.tmp != nil {
-		_ = cw.tmp.Close()
+		// A failed close can surface deferred write errors (NFS, quota at
+		// flush): never commit a body whose final flush did not succeed.
+		if cerr := cw.tmp.Close(); cerr != nil {
+			cw.failed = true
+			cw.fc.logger.Warn("cannot close cache file; entry will not be stored",
+				zap.String("path", cw.tmpPath), zap.Error(cerr))
+		}
 	}
 
 	if handlerErr != nil || cw.failed || cw.hijacked ||
@@ -388,7 +426,7 @@ func (cw *captureWriter) Close(handlerErr error) {
 				zap.Error(handlerErr), zap.Error(cw.req.Context().Err()))
 		}
 		if cw.tmpPath != "" {
-			_ = os.Remove(cw.tmpPath)
+			cw.ix.removeFile(cw.tmpPath)
 		}
 
 		return
@@ -398,7 +436,7 @@ func (cw *captureWriter) Close(handlerErr error) {
 
 	if !cw.ix.ramOnly {
 		if err := os.Rename(cw.tmpPath, cw.final); err != nil {
-			_ = os.Remove(cw.tmpPath)
+			cw.ix.removeFile(cw.tmpPath)
 			cw.fc.logger.Warn("cannot commit cache file; entry not stored",
 				zap.String("path", cw.final), zap.Error(err))
 
@@ -408,7 +446,7 @@ func (cw *captureWriter) Close(handlerErr error) {
 		// Meta sidecar goes in last — its presence marks a complete entry.
 		mf, err := os.OpenFile(cw.metaPath+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
 		if err != nil {
-			_ = os.Remove(cw.final)
+			cw.ix.removeFile(cw.final)
 			cw.fc.logger.Warn("cannot write meta sidecar; entry not stored",
 				zap.String("path", cw.metaPath), zap.Error(err))
 
@@ -416,11 +454,13 @@ func (cw *captureWriter) Close(handlerErr error) {
 		}
 
 		metaSize, err = writeMeta(mf, cw.meta)
-		_ = mf.Close()
+		if cerr := mf.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
 
 		if err != nil {
-			_ = os.Remove(cw.final)
-			_ = os.Remove(cw.metaPath + ".tmp")
+			cw.ix.removeFile(cw.final)
+			cw.ix.removeFile(cw.metaPath + ".tmp")
 			cw.fc.logger.Warn("cannot write meta sidecar; entry not stored",
 				zap.String("path", cw.metaPath), zap.Error(err))
 
@@ -428,8 +468,8 @@ func (cw *captureWriter) Close(handlerErr error) {
 		}
 
 		if err := os.Rename(cw.metaPath+".tmp", cw.metaPath); err != nil {
-			_ = os.Remove(cw.final)
-			_ = os.Remove(cw.metaPath + ".tmp")
+			cw.ix.removeFile(cw.final)
+			cw.ix.removeFile(cw.metaPath + ".tmp")
 			cw.fc.logger.Warn("cannot commit meta sidecar; entry not stored",
 				zap.String("path", cw.metaPath), zap.Error(err))
 
@@ -485,13 +525,13 @@ func (cw *captureWriter) Flush() {
 		return
 	}
 
-	if f, ok := cw.rw.(http.Flusher); ok {
+	if f, ok := cw.writer().(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
 func (cw *captureWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	h, ok := cw.rw.(http.Hijacker)
+	h, ok := cw.writer().(http.Hijacker)
 	if !ok {
 		return nil, nil, http.ErrNotSupported
 	}
@@ -509,4 +549,4 @@ func (cw *captureWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // Unwrap lets http.ResponseController reach the real writer (full-duplex
 // and deadline controls probe through it).
-func (cw *captureWriter) Unwrap() http.ResponseWriter { return cw.rw }
+func (cw *captureWriter) Unwrap() http.ResponseWriter { return cw.writer() }
