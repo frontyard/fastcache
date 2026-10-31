@@ -2,6 +2,7 @@ package fastcache
 
 import (
 	"bytes"
+	"cmp"
 	"container/heap"
 	"crypto/sha256"
 	"encoding/binary"
@@ -16,7 +17,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,6 +71,7 @@ type entry struct {
 	seq            atomic.Uint64 // last-use UnixNano, coarse (see touchGranularity)
 	promoting      atomic.Bool   // a disk hit is currently loading the body into RAM
 	dropped        atomic.Bool   // files/accounting already released (dropFile is idempotent)
+	metaQueued     atomic.Bool   // a meta sidecar rewrite is queued or in flight (queueMeta)
 }
 
 // meta serializes the entry's current state into a sidecar header.
@@ -180,8 +181,10 @@ type index struct {
 	mappingMu sync.Mutex
 	evictMu   sync.Mutex
 	evictCh   chan struct{} // 1-slot wakeup for evictLoop; sends coalesce
+	metaCh    chan *entry   // meta sidecar rewrites for evictLoop to drain (queueMeta)
 	sweepStop chan struct{}
 	stopOnce  sync.Once
+	workers   sync.WaitGroup // evictLoop + sweep; stop() joins them
 }
 
 func newIndex(cfg *FastCache) *index {
@@ -220,6 +223,7 @@ func newIndex(cfg *FastCache) *index {
 			return m
 		}(),
 		evictCh:   make(chan struct{}, 1),
+		metaCh:    make(chan *entry, 1024),
 		sweepStop: make(chan struct{}),
 		metrics:   newCacheMetrics(cfg.Name),
 		logger:    cfg.logger,
@@ -235,33 +239,36 @@ func newIndex(cfg *FastCache) *index {
 
 // start launches the background workers (expiry sweeper + eviction worker).
 // Called only after a successful rebuild, so a failed provision leaves no
-// goroutines behind; stop() halts both.
+// goroutines behind; stop() halts both and waits for them to return.
 func (ix *index) start() {
-	go ix.evictLoop()
-	go ix.sweep()
+	ix.workers.Add(2)
+	go func() { defer ix.workers.Done(); ix.evictLoop() }()
+	go func() { defer ix.workers.Done(); ix.sweep() }()
 }
 
-// lookup returns the live variant for a request, and whether it is stale.
-// A stale entry may be within its SWR window or only retained as an error
-// fallback (between expiresAt+swr and staleAt) — ServeHTTP distinguishes.
-func (ix *index) lookup(r *http.Request) (e *entry, stale, hit bool) {
+// lookup returns the live variant for a request, whether it is stale, and
+// the timestamp it was evaluated at — ServeHTTP reuses now for the serve
+// instead of re-reading the clock several times per hit. A stale entry may
+// be within its SWR window or only retained as an error fallback (between
+// expiresAt+swr and staleAt) — ServeHTTP distinguishes.
+func (ix *index) lookup(r *http.Request) (e *entry, stale, hit bool, now int64) {
 	key := ix.baseKey(r)
 
 	v, ok := ix.mappings.Load(key)
 	if !ok {
-		return nil, false, false
+		return nil, false, false, 0
 	}
 
 	m := v.(*mapping)
 
 	ev, ok := m.variants.Load(varyKey(r, m.varyHeaders))
 	if !ok {
-		return nil, false, false
+		return nil, false, false, 0
 	}
 
 	e = ev.(*entry)
 
-	now := time.Now().UnixNano()
+	now = time.Now().UnixNano()
 
 	if e.dead(now) {
 		if ix.deleteEntry(e) {
@@ -271,14 +278,14 @@ func (ix *index) lookup(r *http.Request) (e *entry, stale, hit bool) {
 			}
 		}
 
-		return nil, false, false
+		return nil, false, false, 0
 	}
 
 	if !ix.noTouch {
 		e.touch(now)
 	}
 
-	return e, e.expired(now), true
+	return e, e.expired(now), true, now
 }
 
 // commit installs a freshly stored variant.
@@ -465,24 +472,51 @@ func (ix *index) sweep() {
 	}
 }
 
-func (ix *index) stop() {
-	ix.stopOnce.Do(func() { close(ix.sweepStop) })
+// drainMeta flushes queued meta sidecar writes on shutdown so the last
+// refreshes still persist. Runs on evictLoop after sweepStop fires.
+func (ix *index) drainMeta() {
+	for {
+		select {
+		case e := <-ix.metaCh:
+			e.metaQueued.Store(false)
+			ix.persistMeta(e)
+		default:
+			return
+		}
+	}
 }
 
-// candidatesBySeq returns live entries accepted by keep, sorted least→most
-// recently used.
-func (ix *index) candidatesBySeq(keep func(*entry) bool) []*entry {
-	var out []*entry
+// stop halts the background workers and waits for them to exit — callers
+// tearing the module down (or removing the storage tree) need the last
+// meta write and expired-file reap to have completed.
+func (ix *index) stop() {
+	ix.stopOnce.Do(func() {
+		close(ix.sweepStop)
+		ix.workers.Wait()
+	})
+}
+
+// evictCandidate pairs an entry with a snapshot of its seq so the sort
+// compares plain ints — a comparator calling seq.Load() would do ~2·n·log n
+// atomic loads on scattered cache lines.
+type evictCandidate struct {
+	e   *entry
+	seq uint64
+}
+
+// candidatesBySeq returns live entries sorted least→most recently used,
+// sequenced by a per-entry seq snapshot taken during the index scan.
+func (ix *index) candidatesBySeq() []evictCandidate {
+	var out []evictCandidate
 
 	ix.entries.Range(func(_, v any) bool {
-		if e := v.(*entry); keep == nil || keep(e) {
-			out = append(out, e)
-		}
+		e := v.(*entry)
+		out = append(out, evictCandidate{e: e, seq: e.seq.Load()})
 
 		return true
 	})
 
-	sort.Slice(out, func(i, j int) bool { return out[i].seq.Load() < out[j].seq.Load() })
+	slices.SortFunc(out, func(a, b evictCandidate) int { return cmp.Compare(a.seq, b.seq) })
 
 	return out
 }
@@ -518,12 +552,22 @@ func (ix *index) maybeEvict() {
 // evictLoop performs budget enforcement on a dedicated goroutine. Woken by
 // maybeEvict, it reaps expired entries and scans the index once per wakeup,
 // freeing each budget to its low-water mark. Budgets may overshoot
-// transiently between the signal and the scan.
+// transiently between the signal and the scan. It also drains the metaCh
+// queue: meta sidecar rewrites queued by queueMeta run here, off the
+// request path.
 func (ix *index) evictLoop() {
 	for {
 		select {
 		case <-ix.sweepStop:
+			ix.drainMeta()
 			return
+		case e := <-ix.metaCh:
+			// Clear the flag before the write: a refresh landing while the
+			// write is in flight re-queues, and the follow-up write persists
+			// the newer state. Clearing after would lose it.
+			e.metaQueued.Store(false)
+			ix.persistMeta(e)
+			continue
 		case <-ix.evictCh:
 		}
 
@@ -532,9 +576,7 @@ func (ix *index) evictLoop() {
 		}
 
 		ix.evictMu.Lock()
-		ix.enforceDiskBudget()
-		ix.enforceCountCap()
-		ix.freeRAM()
+		ix.enforceBudgets()
 		ix.evictMu.Unlock()
 	}
 }
@@ -542,12 +584,29 @@ func (ix *index) evictLoop() {
 // The enforce*/freeRAM scans run only on the evictLoop goroutine, under
 // evictMu. They must not take it again.
 
-func (ix *index) enforceDiskBudget() {
-	if ix.diskBudget <= 0 {
+// enforceBudgets runs one eviction pass over a shared seq-sorted snapshot
+// of the index — the three budget scans see the same ordering and pay for
+// one O(n log n) build instead of three. Entries an earlier scan already
+// removed fail their delete/demote CAS and are skipped. Expired entries are
+// reaped first; if that alone brings every budget under its limit, the
+// scan is skipped entirely.
+func (ix *index) enforceBudgets() {
+	ix.reapExpired()
+
+	if !ix.overBudget() {
 		return
 	}
 
-	ix.reapExpired()
+	cands := ix.candidatesBySeq()
+	ix.enforceDiskBudget(cands)
+	ix.enforceCountCap(cands)
+	ix.freeRAM(cands)
+}
+
+func (ix *index) enforceDiskBudget(cands []evictCandidate) {
+	if ix.diskBudget <= 0 {
+		return
+	}
 
 	over := ix.diskSize.Load() - ix.diskBudget
 	if over <= 0 {
@@ -556,11 +615,12 @@ func (ix *index) enforceDiskBudget() {
 
 	over += ix.diskBudget / evictSlack
 
-	for _, e := range ix.candidatesBySeq(nil) {
+	for _, c := range cands {
 		if over <= 0 {
 			return
 		}
 
+		e := c.e
 		if ix.deleteEntry(e) {
 			ix.metrics.evict("disk")
 			over -= e.fileSize
@@ -572,7 +632,7 @@ func (ix *index) enforceDiskBudget() {
 	}
 }
 
-func (ix *index) enforceCountCap() {
+func (ix *index) enforceCountCap(cands []evictCandidate) {
 	if ix.maxItems <= 0 {
 		return
 	}
@@ -584,11 +644,12 @@ func (ix *index) enforceCountCap() {
 
 	over += ix.maxItems / evictSlack
 
-	for _, e := range ix.candidatesBySeq(nil) {
+	for _, c := range cands {
 		if over <= 0 {
 			return
 		}
 
+		e := c.e
 		if ix.deleteEntry(e) {
 			ix.metrics.evict("count")
 			over--
@@ -600,7 +661,7 @@ func (ix *index) enforceCountCap() {
 }
 
 // freeRAM drops the lowest-seq in-memory bodies until the RAM budget fits.
-func (ix *index) freeRAM() {
+func (ix *index) freeRAM(cands []evictCandidate) {
 	if ix.memBudget <= 0 {
 		return
 	}
@@ -612,9 +673,14 @@ func (ix *index) freeRAM() {
 
 	over += ix.memBudget / evictSlack
 
-	for _, e := range ix.candidatesBySeq(func(e *entry) bool { return e.body.Load() != nil }) {
+	for _, c := range cands {
 		if over <= 0 {
 			return
+		}
+
+		e := c.e
+		if e.body.Load() == nil {
+			continue
 		}
 
 		if ix.ramOnly {
@@ -969,8 +1035,8 @@ func (ix *index) rebuild() error {
 
 // refresh304 merges a 304 response into a stored entry (RFC 9111 §4.3.4):
 // the 304's header fields replace same-named stored fields, freshness
-// deadlines are recomputed, and the meta sidecar is rewritten so the update
-// survives a restart. The body file is untouched.
+// deadlines are recomputed, and the meta sidecar is queued for rewrite so
+// the update survives a restart. The body file is untouched.
 func (ix *index) refresh304(e *entry, h http.Header) {
 	old := *e.headers.Load()
 	merged := make(http.Header, len(old)+len(h))
@@ -991,11 +1057,38 @@ func (ix *index) refresh304(e *entry, h http.Header) {
 	e.mustRevalidate.Store(mustRevalidate(responseCC(merged)))
 
 	ix.scheduleExpiry(e)
-	ix.persistMeta(e)
+	ix.queueMeta(e)
+}
+
+// queueMeta schedules an entry's meta sidecar rewrite on the evictLoop
+// worker. persistMeta is open+encode+write+rename — too slow to run on the
+// request path each time a 304 merge updates freshness. Writes coalesce via
+// metaQueued: while one write is queued or in flight, a further refresh just
+// lets the pending write capture the newer state (persistMeta snapshots the
+// atomics at write time). A saturated queue — a revalidation storm deeper
+// than the buffer — falls back to an inline write rather than drop the
+// update.
+func (ix *index) queueMeta(e *entry) {
+	if ix.ramOnly || e.metaPath == "" {
+		return
+	}
+
+	if !e.metaQueued.CompareAndSwap(false, true) {
+		return
+	}
+
+	select {
+	case ix.metaCh <- e:
+	default:
+		e.metaQueued.Store(false)
+		ix.persistMeta(e)
+	}
 }
 
 // persistMeta rewrites an entry's meta sidecar after an in-place update.
-// No-op for RAM-only entries, and skipped when the entry has meanwhile
+// Runs on the evictLoop worker (queued via queueMeta); request-path callers
+// must not invoke it directly. No-op for RAM-only entries, and skipped
+// when the entry has meanwhile
 // been purged or evicted — writing it back would resurrect an orphan
 // sidecar (rebuild would reap it, but not until the next restart).
 func (ix *index) persistMeta(e *entry) {
