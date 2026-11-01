@@ -2,6 +2,7 @@ package fastcache
 
 import (
 	"bytes"
+	"cmp"
 	"container/heap"
 	"crypto/sha256"
 	"encoding/binary"
@@ -15,8 +16,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -182,6 +183,7 @@ type index struct {
 	evictCh   chan struct{} // 1-slot wakeup for evictLoop; sends coalesce
 	sweepStop chan struct{}
 	stopOnce  sync.Once
+	workers   sync.WaitGroup // evictLoop + sweep; stop() joins them
 }
 
 func newIndex(cfg *FastCache) *index {
@@ -235,33 +237,35 @@ func newIndex(cfg *FastCache) *index {
 
 // start launches the background workers (expiry sweeper + eviction worker).
 // Called only after a successful rebuild, so a failed provision leaves no
-// goroutines behind; stop() halts both.
+// goroutines behind; stop() halts both and waits for them to return.
 func (ix *index) start() {
-	go ix.evictLoop()
-	go ix.sweep()
+	ix.workers.Go(ix.evictLoop)
+	ix.workers.Go(ix.sweep)
 }
 
-// lookup returns the live variant for a request, and whether it is stale.
-// A stale entry may be within its SWR window or only retained as an error
-// fallback (between expiresAt+swr and staleAt) — ServeHTTP distinguishes.
-func (ix *index) lookup(r *http.Request) (e *entry, stale, hit bool) {
+// lookup returns the live variant for a request, whether it is stale, and
+// the timestamp it was evaluated at — ServeHTTP reuses now for the serve
+// instead of re-reading the clock several times per hit. A stale entry may
+// be within its SWR window or only retained as an error fallback (between
+// expiresAt+swr and staleAt) — ServeHTTP distinguishes.
+func (ix *index) lookup(r *http.Request) (e *entry, stale, hit bool, now int64) {
 	key := ix.baseKey(r)
 
 	v, ok := ix.mappings.Load(key)
 	if !ok {
-		return nil, false, false
+		return nil, false, false, 0
 	}
 
 	m := v.(*mapping)
 
 	ev, ok := m.variants.Load(varyKey(r, m.varyHeaders))
 	if !ok {
-		return nil, false, false
+		return nil, false, false, 0
 	}
 
 	e = ev.(*entry)
 
-	now := time.Now().UnixNano()
+	now = time.Now().UnixNano()
 
 	if e.dead(now) {
 		if ix.deleteEntry(e) {
@@ -271,14 +275,14 @@ func (ix *index) lookup(r *http.Request) (e *entry, stale, hit bool) {
 			}
 		}
 
-		return nil, false, false
+		return nil, false, false, 0
 	}
 
 	if !ix.noTouch {
 		e.touch(now)
 	}
 
-	return e, e.expired(now), true
+	return e, e.expired(now), true, now
 }
 
 // commit installs a freshly stored variant.
@@ -465,24 +469,37 @@ func (ix *index) sweep() {
 	}
 }
 
+// stop halts the background workers and waits for them to exit — callers
+// tearing the module down (or removing the storage tree) need the last
+// expired-file reap and eviction pass to have completed.
 func (ix *index) stop() {
-	ix.stopOnce.Do(func() { close(ix.sweepStop) })
+	ix.stopOnce.Do(func() {
+		close(ix.sweepStop)
+		ix.workers.Wait()
+	})
 }
 
-// candidatesBySeq returns live entries accepted by keep, sorted least→most
-// recently used.
-func (ix *index) candidatesBySeq(keep func(*entry) bool) []*entry {
-	var out []*entry
+// evictCandidate pairs an entry with a snapshot of its seq so the sort
+// compares plain ints — a comparator calling seq.Load() would do ~2·n·log n
+// atomic loads on scattered cache lines.
+type evictCandidate struct {
+	e   *entry
+	seq uint64
+}
+
+// candidatesBySeq returns live entries sorted least→most recently used,
+// sequenced by a per-entry seq snapshot taken during the index scan.
+func (ix *index) candidatesBySeq() []evictCandidate {
+	var out []evictCandidate
 
 	ix.entries.Range(func(_, v any) bool {
-		if e := v.(*entry); keep == nil || keep(e) {
-			out = append(out, e)
-		}
+		e := v.(*entry)
+		out = append(out, evictCandidate{e: e, seq: e.seq.Load()})
 
 		return true
 	})
 
-	sort.Slice(out, func(i, j int) bool { return out[i].seq.Load() < out[j].seq.Load() })
+	slices.SortFunc(out, func(a, b evictCandidate) int { return cmp.Compare(a.seq, b.seq) })
 
 	return out
 }
@@ -532,9 +549,7 @@ func (ix *index) evictLoop() {
 		}
 
 		ix.evictMu.Lock()
-		ix.enforceDiskBudget()
-		ix.enforceCountCap()
-		ix.freeRAM()
+		ix.enforceBudgets()
 		ix.evictMu.Unlock()
 	}
 }
@@ -542,12 +557,29 @@ func (ix *index) evictLoop() {
 // The enforce*/freeRAM scans run only on the evictLoop goroutine, under
 // evictMu. They must not take it again.
 
-func (ix *index) enforceDiskBudget() {
-	if ix.diskBudget <= 0 {
+// enforceBudgets runs one eviction pass over a shared seq-sorted snapshot
+// of the index — the three budget scans see the same ordering and pay for
+// one O(n log n) build instead of three. Entries an earlier scan already
+// removed fail their delete/demote CAS and are skipped. Expired entries are
+// reaped first; if that alone brings every budget under its limit, the
+// scan is skipped entirely.
+func (ix *index) enforceBudgets() {
+	ix.reapExpired()
+
+	if !ix.overBudget() {
 		return
 	}
 
-	ix.reapExpired()
+	cands := ix.candidatesBySeq()
+	ix.enforceDiskBudget(cands)
+	ix.enforceCountCap(cands)
+	ix.freeRAM(cands)
+}
+
+func (ix *index) enforceDiskBudget(cands []evictCandidate) {
+	if ix.diskBudget <= 0 {
+		return
+	}
 
 	over := ix.diskSize.Load() - ix.diskBudget
 	if over <= 0 {
@@ -556,11 +588,12 @@ func (ix *index) enforceDiskBudget() {
 
 	over += ix.diskBudget / evictSlack
 
-	for _, e := range ix.candidatesBySeq(nil) {
+	for _, c := range cands {
 		if over <= 0 {
 			return
 		}
 
+		e := c.e
 		if ix.deleteEntry(e) {
 			ix.metrics.evict("disk")
 			over -= e.fileSize
@@ -572,7 +605,7 @@ func (ix *index) enforceDiskBudget() {
 	}
 }
 
-func (ix *index) enforceCountCap() {
+func (ix *index) enforceCountCap(cands []evictCandidate) {
 	if ix.maxItems <= 0 {
 		return
 	}
@@ -584,11 +617,12 @@ func (ix *index) enforceCountCap() {
 
 	over += ix.maxItems / evictSlack
 
-	for _, e := range ix.candidatesBySeq(nil) {
+	for _, c := range cands {
 		if over <= 0 {
 			return
 		}
 
+		e := c.e
 		if ix.deleteEntry(e) {
 			ix.metrics.evict("count")
 			over--
@@ -600,7 +634,7 @@ func (ix *index) enforceCountCap() {
 }
 
 // freeRAM drops the lowest-seq in-memory bodies until the RAM budget fits.
-func (ix *index) freeRAM() {
+func (ix *index) freeRAM(cands []evictCandidate) {
 	if ix.memBudget <= 0 {
 		return
 	}
@@ -612,9 +646,14 @@ func (ix *index) freeRAM() {
 
 	over += ix.memBudget / evictSlack
 
-	for _, e := range ix.candidatesBySeq(func(e *entry) bool { return e.body.Load() != nil }) {
+	for _, c := range cands {
 		if over <= 0 {
 			return
+		}
+
+		e := c.e
+		if e.body.Load() == nil {
+			continue
 		}
 
 		if ix.ramOnly {
@@ -832,12 +871,58 @@ func (ix *index) rebuild() error {
 		return err
 	}
 
+	// Scan phase: readMeta + body stat are ~30µs of I/O per entry, which
+	// dominates a large rebuild. Run them on a worker pool and apply the
+	// results sequentially below — ordering-sensitive bookkeeping (first-wins
+	// dedup, tracked/seen sets, warn order) stays deterministic.
+	type scanResult struct {
+		m        *metaHeader
+		metaSize int64
+		bodySize int64
+		bodyOK   bool
+		metaErr  error
+		bodyErr  error
+	}
+
+	results := make([]scanResult, len(metas))
+
+	if !ix.ramOnly {
+		var next atomic.Int64
+		var wg sync.WaitGroup
+
+		for range max(1, min(len(metas), 4*runtime.GOMAXPROCS(0))) {
+			wg.Go(func() {
+				for i := int(next.Add(1)) - 1; i < len(metas); i = int(next.Add(1)) - 1 {
+					metaPath := metas[i]
+					m, ms, err := readMeta(metaPath)
+					results[i].m, results[i].metaSize = m, ms
+					if err != nil {
+						results[i].metaErr = err
+
+						continue
+					}
+
+					info, err := os.Stat(strings.TrimSuffix(metaPath, ".meta"))
+					if err != nil {
+						results[i].bodyErr = err
+
+						continue
+					}
+
+					results[i].bodySize, results[i].bodyOK = info.Size(), true
+				}
+			})
+		}
+		wg.Wait()
+	}
+
 	now := time.Now().UnixNano()
 	tracked := map[string]struct{}{}
 	seen := map[string]struct{}{}
 	var expired, invalid, orphans int
+	var pending []expiryItem
 
-	for _, metaPath := range metas {
+	for i, metaPath := range metas {
 		// RAM-only mode loads nothing; the orphan pass below removes any
 		// files left over from a previous disk-backed configuration.
 		if ix.ramOnly {
@@ -845,25 +930,25 @@ func (ix *index) rebuild() error {
 		}
 
 		bodyPath := strings.TrimSuffix(metaPath, ".meta")
+		res := &results[i]
+		m, metaSize := res.m, res.metaSize
 
-		m, metaSize, err := readMeta(metaPath)
-		if err != nil {
+		if res.metaErr != nil {
 			invalid++
 			ix.logger.Warn("dropping unreadable cache meta file",
-				zap.String("path", metaPath), zap.Error(err))
+				zap.String("path", metaPath), zap.Error(res.metaErr))
 			ix.removeFile(metaPath)
 			tracked[metaPath] = struct{}{} // accounted for — the orphan pass must not recount
 
 			continue
 		}
 
-		info, err := os.Stat(bodyPath)
-		if err != nil {
+		if !res.bodyOK {
 			// The meta commits last at store time, so a present meta with
 			// a missing body means the entry was tampered with.
 			invalid++
 			ix.logger.Warn("cache body file missing; dropping meta sidecar",
-				zap.String("path", metaPath), zap.String("body", bodyPath), zap.Error(err))
+				zap.String("path", metaPath), zap.String("body", bodyPath), zap.Error(res.bodyErr))
 			ix.removeFile(metaPath)
 			tracked[metaPath] = struct{}{}
 
@@ -900,8 +985,8 @@ func (ix *index) rebuild() error {
 			varyK:    m.VaryKey,
 			path:     bodyPath,
 			metaPath: metaPath,
-			size:     info.Size(),
-			fileSize: info.Size() + metaSize,
+			size:     res.bodySize,
+			fileSize: res.bodySize + metaSize,
 			status:   m.Status,
 		}
 		e.headers.Store(&hdr)
@@ -914,7 +999,7 @@ func (ix *index) rebuild() error {
 		ix.entries.Store(fullKey, e)
 		ix.diskSize.Add(e.fileSize)
 		ix.fileCount.Add(1)
-		ix.scheduleExpiry(e)
+		pending = append(pending, expiryItem{key: fullKey, staleAt: m.StaleAt})
 
 		// mapping.varyHeaders is immutable once published (lock-free readers
 		// depend on it): the first-loaded scheme wins, and a meta that
@@ -937,6 +1022,12 @@ func (ix *index) rebuild() error {
 		tracked[metaPath] = struct{}{}
 		tracked[bodyPath] = struct{}{}
 	}
+
+	// One heapify beats n ordered pushes.
+	ix.heapMu.Lock()
+	ix.expQueue = append(ix.expQueue, pending...)
+	heap.Init(&ix.expQueue)
+	ix.heapMu.Unlock()
 
 	// Remove unreferenced fastcache files, then the now empty shard
 	// directories. Foreign files and directories under path are left

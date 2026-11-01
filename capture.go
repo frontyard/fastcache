@@ -2,6 +2,8 @@ package fastcache
 
 import (
 	"bufio"
+	"errors"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -133,7 +135,8 @@ func (cw *captureWriter) decide(status int) {
 		if ce := cw.fc.logger.Check(zap.DebugLevel, "revalidated entry via 304 merge"); ce != nil {
 			ce.Write(zap.String("key", cw.reval.key))
 		}
-		if serr := cw.fc.serveEntry(cw.writer(), serveReq, cw.reval, cw.next, "hit"); serr != nil {
+		if serr := cw.fc.serveEntry(cw.writer(), serveReq, cw.reval, cw.next,
+			time.Now().UnixNano(), "hit"); serr != nil {
 			if ce := cw.fc.logger.Check(zap.DebugLevel, "cannot serve revalidated entry"); ce != nil {
 				ce.Write(zap.String("key", cw.reval.key), zap.Error(serr))
 			}
@@ -151,7 +154,7 @@ func (cw *captureWriter) decide(status int) {
 		cw.fc.logger.Warn("upstream error; serving stale entry",
 			zap.String("key", cw.fallback.key), zap.Int("status", status))
 		if serr := cw.fc.serveEntry(cw.writer(), serveReq, cw.fallback, cw.next,
-			"hit", "fwd=stale", "fwd-status="+strconv.Itoa(status)); serr != nil {
+			time.Now().UnixNano(), "hit", "fwd=stale", "fwd-status="+strconv.Itoa(status)); serr != nil {
 			if ce := cw.fc.logger.Check(zap.DebugLevel, "cannot serve stale fallback"); ce != nil {
 				ce.Write(zap.String("key", cw.fallback.key), zap.Error(serr))
 			}
@@ -210,15 +213,22 @@ func (cw *captureWriter) decide(status int) {
 		cw.tmpPath = cw.final + ".tmp"
 		cw.metaPath = metaPathFor(cw.final)
 
-		if err := os.MkdirAll(filepath.Dir(cw.final), 0o750); err != nil {
-			cw.cacheable = false
-			cw.fc.logger.Warn("cannot create cache directory; response not stored",
-				zap.String("path", filepath.Dir(cw.final)), zap.Error(err))
-
-			return
-		}
-
+		// The shard dir almost always exists — open directly instead of
+		// paying MkdirAll's stats on every fill. On ENOENT (first fill
+		// into a shard, or the dir was removed underneath us) create it
+		// and retry once.
 		f, err := os.OpenFile(cw.tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
+		if errors.Is(err, fs.ErrNotExist) {
+			if merr := os.MkdirAll(filepath.Dir(cw.final), 0o750); merr != nil {
+				cw.cacheable = false
+				cw.fc.logger.Warn("cannot create cache directory; response not stored",
+					zap.String("path", filepath.Dir(cw.final)), zap.Error(merr))
+
+				return
+			}
+
+			f, err = os.OpenFile(cw.tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
+		}
 		if err != nil {
 			cw.cacheable = false
 			cw.fc.logger.Warn("cannot create cache file; response not stored",

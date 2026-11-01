@@ -1245,7 +1245,7 @@ func TestDiskHitPromotesToRAM(t *testing.T) {
 
 	get(t, fc, "/", nil, next)
 
-	e, _, ok := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	e, _, ok, _ := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
 	if !ok {
 		t.Fatal("expected entry")
 	}
@@ -1280,7 +1280,7 @@ func TestPromoteAfterEvictionNoLeak(t *testing.T) {
 
 	get(t, fc, "/", nil, next)
 
-	e, _, ok := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	e, _, ok, _ := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
 	if !ok {
 		t.Fatal("expected entry")
 	}
@@ -2835,7 +2835,7 @@ func TestPromoteBelow(t *testing.T) {
 	get(t, fc, "/large", nil, next)
 	get(t, fc, "/large", nil, next)
 
-	e, _, ok := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/large", nil))
+	e, _, ok, _ := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/large", nil))
 	if !ok {
 		t.Fatal("expected entry for /large")
 	}
@@ -2849,7 +2849,7 @@ func TestPromoteBelow(t *testing.T) {
 	get(t, fc, "/small", nil, next)
 	get(t, fc, "/small", nil, next)
 
-	e, _, ok = fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/small", nil))
+	e, _, ok, _ = fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/small", nil))
 	if !ok {
 		t.Fatal("expected entry for /small")
 	}
@@ -2868,7 +2868,7 @@ func TestPromoteBelowZero(t *testing.T) {
 	get(t, fc, "/", nil, next)
 	get(t, fc, "/", nil, next)
 
-	e, _, ok := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	e, _, ok, _ := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
 	if !ok {
 		t.Fatal("expected entry")
 	}
@@ -3081,7 +3081,7 @@ func TestHijackDiscards(t *testing.T) {
 	}
 
 	// The hijacked capture must be gone — nothing may reach the index.
-	if _, _, ok := fc.idx.lookup(r); ok {
+	if _, _, ok, _ := fc.idx.lookup(r); ok {
 		t.Fatal("hijacked capture was committed")
 	}
 
@@ -3414,7 +3414,7 @@ func TestIfNoneMatchStarNoMerge(t *testing.T) {
 		t.Fatalf("expected client's 304 forwarded, got %d", w.Code)
 	}
 
-	_, stale, ok := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	_, stale, ok, _ := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
 	if !ok || !stale {
 		t.Fatal("*-only 304 must not refresh the stored entry")
 	}
@@ -3931,7 +3931,7 @@ func TestPurgeDuringCapture(t *testing.T) {
 	close(release)
 	<-done
 
-	if _, _, ok := fc.idx.lookup(r); ok {
+	if _, _, ok, _ := fc.idx.lookup(r); ok {
 		t.Fatal("capture committed over a purge")
 	}
 
@@ -4351,7 +4351,7 @@ func obsTestCache(t *testing.T, mutate func(*FastCache)) (*FastCache, *observer.
 func entryPath(t *testing.T, fc *FastCache, target string) string {
 	t.Helper()
 
-	e, _, hit := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com"+target, nil))
+	e, _, hit, _ := fc.idx.lookup(httptest.NewRequest(http.MethodGet, "http://example.com"+target, nil))
 	if !hit {
 		t.Fatalf("no cached entry for %s", target)
 	}
@@ -4693,7 +4693,7 @@ func TestPersistMetaLogsWarn(t *testing.T) {
 	if w := get(t, fc, "/", nil, next); w.Body.String() != "v1" {
 		t.Fatalf("304 merge should serve the stored body, got %q", w.Body.String())
 	}
-	if logs.FilterMessage("cannot write meta sidecar").Len() != 1 {
-		t.Fatalf("failed meta rewrite should warn, got %v", logs.All())
-	}
+	waitFor(t, "meta rewrite failure warning", func() bool {
+		return logs.FilterMessage("cannot write meta sidecar").Len() == 1
+	})
 }

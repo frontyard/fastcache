@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -314,7 +315,7 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	// flight keeps concurrent upstream fetches bounded. Follower waits are
 	// capped, then the request fetches itself.
 	for tries := 0; ; tries++ {
-		e, stale, hit := fc.idx.lookup(r)
+		e, stale, hit, now := fc.idx.lookup(r)
 		if hit {
 			if !stale {
 				fc.idx.metrics.req("hit")
@@ -322,23 +323,23 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 					ce.Write(zap.String("key", e.key), zap.Int("status", e.status), zap.Int64("size", e.size))
 				}
 
-				cs := []string{"hit", ttlParam(e)}
+				cs := []string{"hit", ttlParam(e, now)}
 				if tries > 0 {
 					cs = append(cs, "collapsed")
 				}
 
-				return fc.serveEntry(w, r, e, next, cs...)
+				return fc.serveEntry(w, r, e, next, now, cs...)
 			}
 
 			mr := e.mustRevalidate.Load()
-			if !mr && fc.idx.withinSWR(e, time.Now().UnixNano()) {
+			if !mr && fc.idx.withinSWR(e, now) {
 				fc.refresh(e, r, next)
 				fc.idx.metrics.req("stale")
 				if ce := fc.logger.Check(zap.DebugLevel, "serving stale; revalidating in background"); ce != nil {
 					ce.Write(zap.String("key", e.key))
 				}
 
-				return fc.serveEntry(w, r, e, next, "hit", "fwd=stale")
+				return fc.serveEntry(w, r, e, next, now, "hit", "fwd=stale")
 			}
 
 			// Beyond the SWR window — or any stale entry forbidding stale
@@ -367,7 +368,7 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 					ce.Write(zap.String("key", e.key))
 				}
 
-				return fc.serveEntry(w, r, e, next, "hit", "fwd=stale", "collapsed")
+				return fc.serveEntry(w, r, e, next, now, "hit", "fwd=stale", "collapsed")
 			}
 
 			if ce := fc.logger.Check(zap.DebugLevel, "awaiting in-flight revalidation"); ce != nil {
@@ -562,7 +563,7 @@ func (fc *FastCache) revalidateOrStale(w http.ResponseWriter, r *http.Request, e
 		fc.logger.Warn("revalidation failed; serving stale entry",
 			zap.String("key", e.key), zap.Error(err))
 
-		return fc.serveEntry(cw.writer(), r, e, next, "hit", "fwd=stale")
+		return fc.serveEntry(cw.writer(), r, e, next, time.Now().UnixNano(), "hit", "fwd=stale")
 	}
 
 	return err
@@ -797,10 +798,11 @@ func (s *statusRW) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return h.Hijack()
 }
 
-// serveEntry writes a cached variant to the client. cs holds RFC 9211
-// Cache-Status parameters describing how the hit was reached (e.g. "hit",
-// "fwd=stale", "collapsed").
-func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry, next caddyhttp.Handler, cs ...string) error {
+// serveEntry writes a cached variant to the client. now is the timestamp
+// the hit was evaluated at (lookup already read the clock — hits must not
+// pay for it again). cs holds RFC 9211 Cache-Status parameters describing
+// how the hit was reached (e.g. "hit", "fwd=stale", "collapsed").
+func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry, next caddyhttp.Handler, now int64, cs ...string) error {
 	// RAM tier first; otherwise open the body file for sendfile.
 	var (
 		body *[]byte
@@ -840,7 +842,7 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 
 	// storedAt already embeds the upstream Age (see captureWriter.decide).
 	// Set it before the conditional early-returns so 304s carry it too.
-	if age := (time.Now().UnixNano() - e.storedAt.Load()) / int64(time.Second); age > 0 {
+	if age := (now - e.storedAt.Load()) / int64(time.Second); age > 0 {
 		h["Age"] = []string{strconv.FormatInt(age, 10)}
 	}
 
@@ -875,8 +877,15 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 		if body != nil {
 			_, _ = w.Write(*body)
 		} else {
-			// Copy picks up the ResponseWriter's ReadFrom → sendfile.
-			_, _ = io.Copy(w, f)
+			// fileNoWT hides f's WriteTo so the copy reaches w's ReadFrom
+			// directly — the same hop genericWriteTo performs, minus its
+			// private buffer. Sendfile still works: the conn's sendfile
+			// probe type-asserts the source to syscall.Conn, which the
+			// forwarded SyscallConn keeps exposing. With no ReadFrom the
+			// pooled buffer avoids a fresh 32KB allocation per hit.
+			bufp := copyBufPool.Get().(*[]byte)
+			_, _ = io.CopyBuffer(w, fileNoWT{f}, *bufp)
+			copyBufPool.Put(bufp)
 		}
 
 		return nil
@@ -893,9 +902,27 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 	return nil
 }
 
+// copyBufPool backs the non-sendfile body copy in serveEntry — see the
+// comment at its use.
+var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32<<10); return &b }}
+
+// fileNoWT is *os.File minus its WriterTo: io.Copy checks src.WriterTo
+// first, and (*os.File).WriteTo only zero-copies to a raw network conn —
+// an http.ResponseWriter fails that probe, then falls back to a buffered
+// copy. Hiding WriteTo skips the probe so the destination's ReaderFrom
+// (which can sendfile from a file) is consulted instead — the same role as
+// os.fileWithoutWriteTo. Read and SyscallConn forward so the conn's
+// sendfile probe still finds the file's fd.
+type fileNoWT struct{ f *os.File }
+
+var _ syscall.Conn = fileNoWT{}
+
+func (w fileNoWT) Read(p []byte) (int, error)            { return w.f.Read(p) }
+func (w fileNoWT) SyscallConn() (syscall.RawConn, error) { return w.f.SyscallConn() }
+
 // ttlParam is the Cache-Status ttl parameter: remaining freshness, seconds.
-func ttlParam(e *entry) string {
-	rem := max(e.expiresAt.Load()-time.Now().UnixNano(), 0)
+func ttlParam(e *entry, now int64) string {
+	rem := max(e.expiresAt.Load()-now, 0)
 
 	return "ttl=" + strconv.FormatInt(rem/int64(time.Second), 10)
 }
