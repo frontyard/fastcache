@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -880,10 +881,10 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 			// directly — the same hop genericWriteTo performs, minus its
 			// private buffer. Sendfile still works: the conn's sendfile
 			// probe type-asserts the source to syscall.Conn, which the
-			// embedded *os.File keeps exposing. With no ReadFrom the
+			// forwarded SyscallConn keeps exposing. With no ReadFrom the
 			// pooled buffer avoids a fresh 32KB allocation per hit.
 			bufp := copyBufPool.Get().(*[]byte)
-			_, _ = io.CopyBuffer(w, fileNoWT{File: f}, *bufp)
+			_, _ = io.CopyBuffer(w, fileNoWT{f}, *bufp)
 			copyBufPool.Put(bufp)
 		}
 
@@ -905,21 +906,19 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 // comment at its use.
 var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32<<10); return &b }}
 
-// noWriteTo shadows an embedded file's WriteTo — the same hiding trick as
-// os.fileWithoutWriteTo. It must never be invoked.
-type noWriteTo struct{}
-
-func (noWriteTo) WriteTo(io.Writer) (int64, error) { panic("can't happen") }
-
 // fileNoWT is *os.File minus its WriterTo: io.Copy checks src.WriterTo
 // first, and (*os.File).WriteTo only zero-copies to a raw network conn —
 // an http.ResponseWriter fails that probe, then falls back to a buffered
 // copy. Hiding WriteTo skips the probe so the destination's ReaderFrom
-// (which can sendfile from a file) is consulted instead.
-type fileNoWT struct {
-	noWriteTo
-	*os.File
-}
+// (which can sendfile from a file) is consulted instead — the same role as
+// os.fileWithoutWriteTo. Read and SyscallConn forward so the conn's
+// sendfile probe still finds the file's fd.
+type fileNoWT struct{ f *os.File }
+
+var _ syscall.Conn = fileNoWT{}
+
+func (w fileNoWT) Read(p []byte) (int, error)            { return w.f.Read(p) }
+func (w fileNoWT) SyscallConn() (syscall.RawConn, error) { return w.f.SyscallConn() }
 
 // ttlParam is the Cache-Status ttl parameter: remaining freshness, seconds.
 func ttlParam(e *entry, now int64) string {

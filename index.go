@@ -239,9 +239,8 @@ func newIndex(cfg *FastCache) *index {
 // Called only after a successful rebuild, so a failed provision leaves no
 // goroutines behind; stop() halts both and waits for them to return.
 func (ix *index) start() {
-	ix.workers.Add(2)
-	go func() { defer ix.workers.Done(); ix.evictLoop() }()
-	go func() { defer ix.workers.Done(); ix.sweep() }()
+	ix.workers.Go(ix.evictLoop)
+	ix.workers.Go(ix.sweep)
 }
 
 // lookup returns the live variant for a request, whether it is stale, and
@@ -892,10 +891,7 @@ func (ix *index) rebuild() error {
 		var wg sync.WaitGroup
 
 		for range max(1, min(len(metas), 4*runtime.GOMAXPROCS(0))) {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
+			wg.Go(func() {
 				for i := int(next.Add(1)) - 1; i < len(metas); i = int(next.Add(1)) - 1 {
 					metaPath := metas[i]
 					m, ms, err := readMeta(metaPath)
@@ -915,7 +911,7 @@ func (ix *index) rebuild() error {
 
 					results[i].bodySize, results[i].bodyOK = info.Size(), true
 				}
-			}()
+			})
 		}
 		wg.Wait()
 	}
