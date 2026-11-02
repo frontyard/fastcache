@@ -30,6 +30,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/dustin/go-humanize"
 	"go.uber.org/zap"
+	"golang.org/x/net/http/httpguts"
 )
 
 func init() {
@@ -129,25 +130,6 @@ func (fc *FastCache) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("lock_timeout: %w", err)
 	}
 
-	for name, v := range map[string]int64{
-		"memory_size": fc.memoryBytes, "disk_size": fc.diskBytes, "promote_below": fc.promoteBelow,
-	} {
-		if v < 0 {
-			return fmt.Errorf("%s must be >= 0, got %d", name, v)
-		}
-	}
-	for name, v := range map[string]time.Duration{
-		"ttl": fc.ttl, "stale_while_revalidate": fc.swr, "stale_if_error": fc.sie,
-		"revalidate_timeout": fc.revalidateTimeout, "lock_timeout": fc.lockTimeout,
-	} {
-		if v < 0 {
-			return fmt.Errorf("%s must be >= 0, got %s", name, v)
-		}
-	}
-	if fc.MaxItems < 0 {
-		return fmt.Errorf("max_items must be >= 0, got %d", fc.MaxItems)
-	}
-
 	if err = fc.compilePurgeAllow(); err != nil {
 		return err
 	}
@@ -241,6 +223,56 @@ func parseStatusTTLs(m map[int]string) (map[int]time.Duration, error) {
 	}
 
 	return out, nil
+}
+
+// Validate implements caddy.Validator. Caddy calls it after Provision, so
+// the parsed fields are already populated; the checks are pure — nothing
+// here may fail only under a running config.
+func (fc *FastCache) Validate() error {
+	for name, v := range map[string]int64{
+		"memory_size": fc.memoryBytes, "disk_size": fc.diskBytes, "promote_below": fc.promoteBelow,
+	} {
+		if v < 0 {
+			return fmt.Errorf("%s must be >= 0, got %d", name, v)
+		}
+	}
+	for name, v := range map[string]time.Duration{
+		"ttl": fc.ttl, "stale_while_revalidate": fc.swr, "stale_if_error": fc.sie,
+		"revalidate_timeout": fc.revalidateTimeout, "lock_timeout": fc.lockTimeout,
+	} {
+		if v < 0 {
+			return fmt.Errorf("%s must be >= 0, got %s", name, v)
+		}
+	}
+	if fc.MaxItems < 0 {
+		return fmt.Errorf("max_items must be >= 0, got %d", fc.MaxItems)
+	}
+
+	// The Caddyfile parser range-checks status_ttl codes at adapt time;
+	// this is the same check for configs that arrive as JSON.
+	for code := range fc.StatusTTL {
+		if code < 100 || code > 599 {
+			return fmt.Errorf("status_ttl: invalid status code %d", code)
+		}
+	}
+
+	// Header names that can't parse never match anything — the entry is
+	// dead config, and the typo behind it would otherwise go unnoticed.
+	for _, h := range fc.Vary {
+		if h == "*" {
+			return fmt.Errorf(`vary: "*" is not a whitelist entry (a Vary: * response is never cached regardless)`)
+		}
+		if !httpguts.ValidHeaderFieldName(h) {
+			return fmt.Errorf("vary: invalid header name %q", h)
+		}
+	}
+	for name := range fc.MatchHeaders {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return fmt.Errorf("match_header: invalid header name %q", name)
+		}
+	}
+
+	return nil
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
@@ -1181,6 +1213,7 @@ func (fc *FastCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 var (
 	_ caddy.Provisioner           = (*FastCache)(nil)
+	_ caddy.Validator             = (*FastCache)(nil)
 	_ caddy.CleanerUpper          = (*FastCache)(nil)
 	_ caddyfile.Unmarshaler       = (*FastCache)(nil)
 	_ caddyhttp.MiddlewareHandler = (*FastCache)(nil)
