@@ -2560,6 +2560,9 @@ func TestProvisionAndCleanup(t *testing.T) {
 	if err := fc.Provision(caddy.Context{}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
+	if err := fc.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
 
 	if fc.idx == nil || fc.memoryBytes != 16_000_000 || fc.swr != 30*time.Second || fc.sie != time.Minute {
 		t.Fatal("Provision did not wire config into the index")
@@ -2587,7 +2590,7 @@ func TestProvisionAndCleanup(t *testing.T) {
 	}
 }
 
-// TestProvisionBadConfig: malformed option values must fail Provision.
+// TestProvisionBadConfig: unparseable option values must fail Provision.
 func TestProvisionBadConfig(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -2601,14 +2604,6 @@ func TestProvisionBadConfig(t *testing.T) {
 		{"bad revalidate_timeout", func(fc *FastCache) { fc.RevalidateTimeout = "later" }},
 		{"bad purge_allow", func(fc *FastCache) { fc.PurgeAllow = []string{"not-an-ip"} }},
 		{"bad promote_below", func(fc *FastCache) { fc.PromoteBelow = "lots" }},
-		{"negative memory_size", func(fc *FastCache) { fc.MemorySize = "-1" }},
-		{"negative disk_size", func(fc *FastCache) { fc.DiskSize = "-1" }},
-		{"negative ttl", func(fc *FastCache) { fc.TTL = "-1h" }},
-		{"negative swr", func(fc *FastCache) { fc.StaleWhileRevalidate = "-5s" }},
-		{"negative sie", func(fc *FastCache) { fc.StaleIfError = "-5s" }},
-		{"negative revalidate_timeout", func(fc *FastCache) { fc.RevalidateTimeout = "-5s" }},
-		{"negative max_items", func(fc *FastCache) { fc.MaxItems = -5 }},
-		{"negative promote_below", func(fc *FastCache) { fc.PromoteBelow = "-1" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fc := &FastCache{Path: t.TempDir(), TTL: "1h"}
@@ -2616,6 +2611,46 @@ func TestProvisionBadConfig(t *testing.T) {
 
 			if err := fc.Provision(caddy.Context{}); err == nil {
 				t.Fatal("expected Provision to fail")
+			}
+		})
+	}
+}
+
+// TestValidateBadConfig: values that parse but are out of range or
+// meaningless must fail Validate — Provision itself accepts them.
+func TestValidateBadConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*FastCache)
+	}{
+		{"negative memory_size", func(fc *FastCache) { fc.MemorySize = "-1" }},
+		{"negative disk_size", func(fc *FastCache) { fc.DiskSize = "-1" }},
+		{"negative ttl", func(fc *FastCache) { fc.TTL = "-1h" }},
+		{"negative swr", func(fc *FastCache) { fc.StaleWhileRevalidate = "-5s" }},
+		{"negative sie", func(fc *FastCache) { fc.StaleIfError = "-5s" }},
+		{"negative revalidate_timeout", func(fc *FastCache) { fc.RevalidateTimeout = "-5s" }},
+		{"negative lock_timeout", func(fc *FastCache) { fc.LockTimeout = "-5s" }},
+		{"negative max_items", func(fc *FastCache) { fc.MaxItems = -5 }},
+		{"negative promote_below", func(fc *FastCache) { fc.PromoteBelow = "-1" }},
+		{"status_ttl code too low", func(fc *FastCache) { fc.StatusTTL = map[int]string{99: "1s"} }},
+		{"status_ttl code too high", func(fc *FastCache) { fc.StatusTTL = map[int]string{600: "1s"} }},
+		{"vary invalid header name", func(fc *FastCache) { fc.Vary = []string{"Not A Header"} }},
+		{"vary star", func(fc *FastCache) { fc.Vary = []string{"*"} }},
+		{"match_header invalid name", func(fc *FastCache) {
+			fc.MatchHeaders = map[string][]string{"Not A Header": {"x"}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &FastCache{Path: t.TempDir(), TTL: "1h"}
+			tc.mutate(fc)
+
+			if err := fc.Provision(caddy.Context{}); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			t.Cleanup(func() { _ = fc.Cleanup() })
+
+			if err := fc.Validate(); err == nil {
+				t.Fatal("expected Validate to fail")
 			}
 		})
 	}
