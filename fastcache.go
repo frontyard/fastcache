@@ -2,6 +2,10 @@
 // a two-tier store: an in-memory body tier under memory_size, and a disk
 // capacity tier under disk_size. Hits are served either from RAM or via
 // kernel sendfile, with no locks on the read path.
+//
+// It registers two Caddy modules: the http.handlers.fastcache request
+// handler (Caddyfile directive "fastcache") and admin.api.fastcache, which
+// exposes cache inspection and bulk purge on the admin endpoint.
 package fastcache
 
 import (
@@ -38,27 +42,113 @@ func init() {
 	httpcaddyfile.RegisterHandlerDirective("fastcache", parseFastCache)
 }
 
-// FastCache is the http.handlers.fastcache module.
+// FastCache is an HTTP handler module (http.handlers.fastcache; Caddyfile
+// directive "fastcache") that caches GET/HEAD responses in a two-tier
+// store: an in-memory body tier bounded by memory_size, and a disk
+// capacity tier bounded by disk_size. Hits are served either from RAM or
+// via kernel sendfile, with no locks on the read path.
+//
+// On a miss the handler tees the upstream response into the cache while
+// streaming it to the client, and concurrent misses for the same key are
+// coalesced onto a single upstream fill. Expired entries may be served
+// while one background revalidation runs (stale_while_revalidate) or kept
+// as upstream-failure fallback (stale_if_error). Entries are keyed on a
+// placeholder template plus an explicit vary list, and can be evicted by
+// PURGE requests or via the companion admin.api.fastcache module.
+//
+// The handler must be routed before the upstream handler — inside a
+// route block or otherwise earlier in the middleware chain:
+//
+//	route {
+//	    fastcache {
+//	        path        /var/cache/fastcache
+//	        memory_size 64MB
+//	        disk_size   1GB
+//	        ttl         1h
+//	    }
+//	    reverse_proxy origin:8000
+//	}
 type FastCache struct {
-	Path                 string              `json:"path,omitempty"`
-	Name                 string              `json:"name,omitempty"`
-	MemorySize           string              `json:"memory_size,omitempty"`
-	DiskSize             string              `json:"disk_size,omitempty"`
-	MaxItems             int                 `json:"max_items,omitempty"`
-	TTL                  string              `json:"ttl,omitempty"`
-	StaleWhileRevalidate string              `json:"stale_while_revalidate,omitempty"`
-	StaleIfError         string              `json:"stale_if_error,omitempty"`
-	StatusTTL            map[int]string      `json:"status_ttl,omitempty"`
-	CacheKey             string              `json:"cache_key,omitempty"`
-	MatchHeaders         map[string][]string `json:"match_headers,omitempty"`
-	Vary                 []string            `json:"vary,omitempty"`
-	DisableTouchOnHit    bool                `json:"disable_touch_on_hit,omitempty"`
-	PurgeAllow           []string            `json:"purge_allow,omitempty"`
-	HonorRequestCC       bool                `json:"honor_request_cache_control,omitempty"`
-	PromoteBelow         string              `json:"promote_below,omitempty"`
-	StoreSetCookie       bool                `json:"store_set_cookie,omitempty"`
-	RevalidateTimeout    string              `json:"revalidate_timeout,omitempty"`
-	LockTimeout          string              `json:"lock_timeout,omitempty"`
+	// Path is the directory holding cached body files and their .meta
+	// sidecars; it must be dedicated to this block
+	// (default "/var/cache/fastcache").
+	Path string `json:"path,omitempty"`
+
+	// Name labels this instance in the "name" metric label; unnamed
+	// instances aggregate under name="".
+	Name string `json:"name,omitempty"`
+
+	// MemorySize is the RAM body-tier budget as a humanize size or byte
+	// count (default "64MB"); "0" selects disk-only mode.
+	MemorySize string `json:"memory_size,omitempty"`
+
+	// DiskSize is the disk-tier budget (default "1GB"); "0" selects
+	// RAM-only mode — no files and no persistence across restarts.
+	DiskSize string `json:"disk_size,omitempty"`
+
+	// MaxItems caps the number of cached entries (unlimited by default).
+	MaxItems int `json:"max_items,omitempty"`
+
+	// TTL is the fallback freshness lifetime for responses carrying no
+	// max-age, s-maxage, or Expires (default "1h").
+	TTL string `json:"ttl,omitempty"`
+
+	// StaleWhileRevalidate lets an expired entry be served while one
+	// background revalidation runs (default "0": disabled).
+	StaleWhileRevalidate string `json:"stale_while_revalidate,omitempty"`
+
+	// StaleIfError retains expired entries for this long as fallback
+	// when the upstream fails (default "0": disabled).
+	StaleIfError string `json:"stale_if_error,omitempty"`
+
+	// StatusTTL maps status codes to a freshness cap which bounds even
+	// explicit upstream freshness; a "0" duration disables storing that
+	// status entirely.
+	StatusTTL map[int]string `json:"status_ttl,omitempty"`
+
+	// CacheKey is a placeholder template for the cache key
+	// (default: host + request URI).
+	CacheKey string `json:"cache_key,omitempty"`
+
+	// MatchHeaders restricts storing to responses whose named header
+	// equals one of the listed values.
+	MatchHeaders map[string][]string `json:"match_headers,omitempty"`
+
+	// Vary whitelists which Vary response headers are keyed on as
+	// variants.
+	Vary []string `json:"vary,omitempty"`
+
+	// DisableTouchOnHit skips the LRU timestamp update on cache hits
+	// (rarely needed — the touch is a coarse atomic write).
+	DisableTouchOnHit bool `json:"disable_touch_on_hit,omitempty"`
+
+	// PurgeAllow lists the IPs or CIDRs permitted to send PURGE
+	// requests (default: loopback only).
+	PurgeAllow []string `json:"purge_allow,omitempty"`
+
+	// HonorRequestCC makes client Cache-Control no-cache/no-store and
+	// Pragma bypass the cache; by default they are ignored, nginx-style.
+	HonorRequestCC bool `json:"honor_request_cache_control,omitempty"`
+
+	// PromoteBelow bounds which body sizes promote into the RAM tier;
+	// larger bodies always serve via sendfile (default "16KB"; "0"
+	// disables promotion entirely).
+	PromoteBelow string `json:"promote_below,omitempty"`
+
+	// StoreSetCookie permits storing responses carrying Set-Cookie. It
+	// is off by default because a stored cookie is replayed to every
+	// later client (session fixation); enable only for upstreams whose
+	// Set-Cookie is safe to share.
+	StoreSetCookie bool `json:"store_set_cookie,omitempty"`
+
+	// RevalidateTimeout bounds a single upstream revalidation — and a
+	// fill whose client went away (default "30s"; "0" = unbounded).
+	RevalidateTimeout string `json:"revalidate_timeout,omitempty"`
+
+	// LockTimeout bounds how long a coalesced request may wait on an
+	// in-flight fill or revalidation before fetching upstream itself
+	// (default "30s"; "0" = unbounded).
+	LockTimeout string `json:"lock_timeout,omitempty"`
 
 	memoryBytes       int64
 	diskBytes         int64
@@ -1079,7 +1169,32 @@ func parseFastCache(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	return &fc, nil
 }
 
-// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
+// UnmarshalCaddyfile sets up the handler from Caddyfile tokens. Syntax:
+//
+//	fastcache [<matcher>] {
+//	    name                        <name>
+//	    path                        <dir>
+//	    memory_size                 <size>
+//	    disk_size                   <size>
+//	    max_items                   <num>
+//	    ttl                         <duration>
+//	    stale_while_revalidate      <duration>
+//	    stale_if_error              <duration>
+//	    status_ttl                  <code>... <duration>
+//	    cache_key                   <template>
+//	    match_header                <name> <values...>
+//	    vary                        <names...>
+//	    disable_touch_on_hit
+//	    purge_allow                 <ip|cidr>...
+//	    honor_request_cache_control
+//	    store_set_cookie
+//	    promote_below               <size>
+//	    revalidate_timeout          <duration>
+//	    lock_timeout                <duration>
+//	}
+//
+// status_ttl and match_header may be repeated; vary and purge_allow
+// accumulate across repeats.
 func (fc *FastCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		for d.NextBlock(0) {

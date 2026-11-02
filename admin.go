@@ -19,9 +19,15 @@ func init() {
 	caddy.RegisterModule(adminAPI{})
 }
 
-// adminAPI exposes cache inspection and bulk purge on caddy's admin
-// endpoint as module admin.api.fastcache. Access control is inherited from
-// the admin listener (loopback-only by default).
+// adminAPI is the admin.api.fastcache module: it exposes cache inspection
+// and bulk purge on caddy's admin endpoint. Access control is inherited
+// from the admin listener (loopback-only by default).
+//
+//	GET    /fastcache/keys   lists every cached base key across all
+//	                         fastcache instances, sorted
+//	DELETE /fastcache/purge  {"pattern": "<RE2>"} — evicts every base key
+//	                         matching the regex, all variants; the body is
+//	                         capped at 1MB and pattern must be valid RE2
 type adminAPI struct{}
 
 func (adminAPI) CaddyModule() caddy.ModuleInfo {
