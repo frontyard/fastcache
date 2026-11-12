@@ -873,7 +873,7 @@ func TestRestartRebuild(t *testing.T) {
 }
 
 // TestRebuildRejectsOldMagic: metas written under a previous format version
-// (FCH1) carry stale varyKey encodings — they must be rejected and their
+// (FCH2) carry stale key encodings — they must be rejected and their
 // files reaped rather than loaded as unreachable entries.
 func TestRebuildRejectsOldMagic(t *testing.T) {
 	fc := newTestCache(t, nil)
@@ -893,7 +893,7 @@ func TestRebuildRejectsOldMagic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	copy(data[:4], "FCH1")
+	copy(data[:4], "FCH2")
 	if err := os.WriteFile(metaPath, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1459,7 +1459,7 @@ func TestRestoreAfterRestart(t *testing.T) {
 	defer fc2.idx.stop()
 
 	for range 3 {
-		if fc2.idx.purge("example.comhttp://example.com/", "purge") != 1 {
+		if fc2.idx.purge("http://example.comhttp://example.com/", "purge") != 1 {
 			t.Fatal("expected one variant to purge")
 		}
 
@@ -3768,6 +3768,61 @@ func TestPurgeLocationInvalidation(t *testing.T) {
 
 	if calls.Load() != 7 {
 		t.Fatalf("expected 7 upstream calls, got %d", calls.Load())
+	}
+}
+
+// TestSchemeSplitsCacheKey: a scheme-dependent response (an HTTP->HTTPS
+// redirect) stored for a plain-HTTP request must not be served to HTTPS
+// requests for the same host and path.
+func TestSchemeSplitsCacheKey(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		if r.TLS == nil {
+			w.Header().Set("Location", "https://example.com/")
+			w.WriteHeader(http.StatusMovedPermanently)
+
+			return nil
+		}
+		_, _ = w.Write([]byte("secure"))
+
+		return nil
+	})
+
+	serve := func(target string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, target, nil)
+		r.RequestURI = r.URL.RequestURI() // origin-form, as a real server sees it
+		w := httptest.NewRecorder()
+		if err := fc.ServeHTTP(w, r, next); err != nil {
+			t.Fatal(err)
+		}
+
+		return w
+	}
+
+	if w := serve("http://example.com/"); w.Code != http.StatusMovedPermanently {
+		t.Fatalf("expected 301 over HTTP, got %d", w.Code)
+	}
+	if w := serve("http://example.com/"); !strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+		t.Fatal("HTTP redirect should be cached")
+	}
+
+	w := serve("https://example.com/")
+	if w.Code != http.StatusOK || w.Body.String() != "secure" {
+		t.Fatalf("HTTPS request served the HTTP entry: %d %q", w.Code, w.Body.String())
+	}
+	if strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+		t.Fatal("HTTPS request should miss")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 upstream calls, got %d", calls.Load())
+	}
+
+	if w := serve("https://example.com/"); w.Code != http.StatusOK || !strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+		t.Fatal("HTTPS response should be cached under its own key")
 	}
 }
 

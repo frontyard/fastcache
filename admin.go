@@ -46,7 +46,8 @@ func (adminAPI) Routes() []caddy.AdminRoute {
 }
 
 // listCacheKeys answers GET /fastcache/keys with every cached base key
-// (host + requestURI, or the resolved cache_key) across all instances.
+// (scheme://host + requestURI, or the resolved cache_key) across all
+// instances.
 func listCacheKeys(w http.ResponseWriter, r *http.Request) error {
 	if r.Method != http.MethodGet {
 		return caddy.APIError{HTTPStatus: http.StatusMethodNotAllowed, Err: fmt.Errorf("method not allowed")}

@@ -411,12 +411,13 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 							continue
 						}
 						host := r.Host
-						fc.idx.purge(host+uri, "invalidate")
+						scheme := keyScheme(r)
+						fc.idx.purge(schemeKey(scheme, host, uri), "invalidate")
 						// Absolute-form requests (RequestURI carries the
 						// whole URI) store under host+full URI — purge that
 						// spelling too.
 						if full := ref.String(); full != uri {
-							fc.idx.purge(host+full, "invalidate")
+							fc.idx.purge(schemeKey(scheme, host, full), "invalidate")
 						}
 					}
 				}
