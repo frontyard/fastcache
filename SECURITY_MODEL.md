@@ -31,7 +31,7 @@ silently weakens a guarantee.
 ## Components
 
 | Component | Code |
-|---|---|
+| --- | --- |
 | Cache core | `fastcache.go` (ServeHTTP, PURGE, revalidation), `index.go` (keys, variants, eviction, on-disk format, rebuild), `capture.go` (capture and atomic commit), `cacheable.go` (bypass, cacheability, freshness), `metrics.go` |
 | Admin API | `admin.go`: `GET /fastcache/keys`, `DELETE /fastcache/purge` (RE2 pattern) |
 
