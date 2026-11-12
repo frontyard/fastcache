@@ -218,7 +218,9 @@ retention window: an entry lives until `expiry + max(swr, sie)`.
   re-fetch. A 304 only merges when it answers the entry's own validators or
   a client `If-None-Match` naming the stored ETag; a bare `*` proves a
   representation exists upstream, not that ours is current, so it is never
-  merged.
+  merged. A 304 that makes the entry unstorable — `no-store`, `private`, or
+  `Set-Cookie` without `store_set_cookie` — is never merged either: the
+  requester gets the body with the 304's headers and the entry is dropped.
 - Every revalidation — background refresh or synchronous — is bounded by
   `revalidate_timeout` on a context detached from the triggering request,
   so a hung upstream can't leak the goroutine or pin the coalescing flight.

@@ -3504,6 +3504,126 @@ func TestRefresh304Deleted(t *testing.T) {
 	}
 }
 
+// TestRefresh304SetCookie: a 304 carrying Set-Cookie must not merge it
+// into the shared entry — the requester gets its cookie, the entry is
+// dropped, and later visitors never see it.
+func TestRefresh304SetCookie(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleIfError = "10s"
+	})
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "public")
+		w.Header().Set("ETag", `"v1"`)
+		if n == 2 {
+			w.Header().Set("Set-Cookie", "sid=alice")
+			w.WriteHeader(http.StatusNotModified)
+			return nil
+		}
+		_, _ = w.Write([]byte("body"))
+		return nil
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(80 * time.Millisecond)
+
+	// Synchronous revalidation (outside SWR): upstream answers 304 with
+	// the requester's session cookie.
+	w := get(t, fc, "/", http.Header{"Cookie": {"sid=alice"}}, next)
+	if w.Body.String() != "body" || w.Header().Get("Set-Cookie") != "sid=alice" {
+		t.Fatalf("requester should get the body and its own cookie, got %q / %q",
+			w.Body.String(), w.Header().Get("Set-Cookie"))
+	}
+
+	w = get(t, fc, "/", nil, next)
+	if sc := w.Header().Get("Set-Cookie"); sc != "" {
+		t.Fatalf("Set-Cookie from a 304 leaked to another client: %q", sc)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("entry should have been dropped and refetched, got %d upstream calls", got)
+	}
+}
+
+// TestRefresh304Private: a 304 marking the response private (here via the
+// background SWR refresh) makes the entry unstorable — it is dropped
+// instead of being refreshed.
+func TestRefresh304Private(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleWhileRevalidate = "5s"
+	})
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		n := calls.Add(1)
+		w.Header().Set("ETag", `"v1"`)
+		if n == 2 {
+			w.Header().Set("Cache-Control", "private, max-age=60")
+			w.WriteHeader(http.StatusNotModified)
+			return nil
+		}
+		w.Header().Set("Cache-Control", "public")
+		_, _ = w.Write([]byte("body"))
+		return nil
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(80 * time.Millisecond)
+
+	get(t, fc, "/", nil, next) // stale serve; background refresh gets the private 304
+	waitFor(t, "entry dropped after private 304", func() bool {
+		n := 0
+		fc.idx.entries.Range(func(_, _ any) bool { n++; return true })
+		return calls.Load() == 2 && n == 0
+	})
+
+	w := get(t, fc, "/", nil, next)
+	if strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+		t.Fatalf("private 304 should not leave a servable entry, got %q", w.Header().Get("Cache-Status"))
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("expected a refetch after the dropped entry, got %d upstream calls", got)
+	}
+}
+
+// TestRefresh304SetCookieOptIn: with store_set_cookie the operator opted in
+// to sharing cookies — a 304's Set-Cookie merges like any other field.
+func TestRefresh304SetCookieOptIn(t *testing.T) {
+	fc := newTestCache(t, func(fc *FastCache) {
+		fc.TTL = "50ms"
+		fc.StaleIfError = "10s"
+		fc.StoreSetCookie = true
+	})
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.Header().Set("ETag", `"v1"`)
+		if n == 2 {
+			w.Header().Set("Set-Cookie", "shared=1")
+			w.WriteHeader(http.StatusNotModified)
+			return nil
+		}
+		w.Header().Set("Cache-Control", "public")
+		_, _ = w.Write([]byte("body"))
+		return nil
+	})
+
+	get(t, fc, "/", nil, next)
+	time.Sleep(80 * time.Millisecond)
+	get(t, fc, "/", nil, next)
+
+	w := get(t, fc, "/", nil, next)
+	if w.Header().Get("Set-Cookie") != "shared=1" || calls.Load() != 2 {
+		t.Fatalf("opted-in 304 Set-Cookie should merge and stay cached, got %q after %d calls",
+			w.Header().Get("Set-Cookie"), calls.Load())
+	}
+}
+
 // TestProxyAuthorizationBypass: proxy credentials mark the request as
 // connection-specific — its response must not be stored or served.
 func TestProxyAuthorizationBypass(t *testing.T) {
