@@ -400,6 +400,60 @@ func TestPurgeAbortsInflightCommit(t *testing.T) {
 	}
 }
 
+// TestUnrelatedInvalidationKeepsInflightCommit: a successful unsafe request
+// on one URL must not abort an in-flight fill of a different URL —
+// otherwise a stream of cheap POSTs keeps anything from being stored.
+func TestUnrelatedInvalidationKeepsInflightCommit(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	slow := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("part1"))
+		close(started)
+		<-release
+		_, _ = w.Write([]byte("part2"))
+
+		return nil
+	})
+
+	ra := httptest.NewRequest(http.MethodGet, "http://example.com/a", nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = fc.ServeHTTP(httptest.NewRecorder(), ra, slow)
+	}()
+
+	<-started
+
+	ok := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+
+		return nil
+	})
+	for range 50 {
+		pr := httptest.NewRequest(http.MethodPost, "http://example.com/b", nil)
+		_ = fc.ServeHTTP(httptest.NewRecorder(), pr, ok)
+	}
+
+	close(release)
+	<-done
+
+	if _, _, found, _ := fc.idx.lookup(ra); !found {
+		t.Fatal("POST to /b aborted the in-flight fill of /a")
+	}
+
+	get(t, fc, "/a", nil, slow)
+	if calls.Load() != 1 {
+		t.Fatalf("expected /a served from cache, upstream calls=%d", calls.Load())
+	}
+}
+
 // TestMultiValuedHeaders: repeated Cache-Control and Vary field lines fold
 // per RFC 9110 §5.3 and must be parsed as one comma-joined value.
 func TestMultiValuedHeaders(t *testing.T) {
@@ -3649,6 +3703,77 @@ func TestSchemeSplitsCacheKey(t *testing.T) {
 
 	if w := serve("https://example.com/"); w.Code != http.StatusOK || !strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
 		t.Fatal("HTTPS response should be cached under its own key")
+	}
+}
+
+// TestPurgeLocationCrossOrigin: Location and Content-Location targets on
+// another origin (host, port or scheme) are never invalidated (RFC 9111 §4.4).
+func TestPurgeLocationCrossOrigin(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	next := handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		calls.Add(1)
+		if r.Method == http.MethodPost {
+			w.Header().Set("Location", r.URL.Query().Get("loc"))
+			w.Header().Set("Content-Location", r.URL.Query().Get("cloc"))
+			w.WriteHeader(http.StatusFound)
+
+			return nil
+		}
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = w.Write([]byte("x"))
+
+		return nil
+	})
+
+	// Origin-form requests, as a server sees them.
+	req := func(method, host, target string) *http.Request {
+		r := httptest.NewRequest(method, "http://"+host+target, nil)
+		r.RequestURI = target
+		r.URL.Scheme, r.URL.Host = "", ""
+
+		return r
+	}
+	getHost := func(host, target string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := req(http.MethodGet, host, target)
+		w := httptest.NewRecorder()
+		if err := fc.ServeHTTP(w, r, next); err != nil {
+			t.Fatal(err)
+		}
+
+		return w
+	}
+
+	getHost("other.example", "/x")
+	getHost("example.com", "/y")
+	getHost("example.com", "/z")
+	getHost("EXAMPLE.com", "/same")
+
+	for _, q := range []string{
+		"loc=http://other.example/x&cloc=http://example.com:8080/y",
+		"loc=https://example.com/z&cloc=//other.example/x",
+	} {
+		r := req(http.MethodPost, "example.com", "/u?"+q)
+		if err := fc.ServeHTTP(httptest.NewRecorder(), r, next); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, c := range [][2]string{{"other.example", "/x"}, {"example.com", "/y"}, {"example.com", "/z"}} {
+		if w := getHost(c[0], c[1]); !strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+			t.Errorf("%s%s invalidated by a cross-origin Location", c[0], c[1])
+		}
+	}
+
+	// Same origin with a differently-cased host is still invalidated.
+	r := req(http.MethodPost, "EXAMPLE.com", "/u?loc=http://example.COM/same")
+	if err := fc.ServeHTTP(httptest.NewRecorder(), r, next); err != nil {
+		t.Fatal(err)
+	}
+	if w := getHost("EXAMPLE.com", "/same"); strings.HasPrefix(w.Header().Get("Cache-Status"), "fastcache; hit") {
+		t.Error("same-origin Location target not invalidated")
 	}
 }
 

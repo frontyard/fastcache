@@ -402,14 +402,16 @@ func (fc *FastCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 						if uri == "" {
 							continue // opaque URI — no origin-form to key on
 						}
-						host := ref.Host
-						if host == "" {
-							host = r.Host
+						// §4.4: never invalidate a URI on a different
+						// origin than the request's.
+						if ref.Host != "" && !strings.EqualFold(ref.Host, r.Host) {
+							continue
 						}
-						scheme := ref.Scheme
-						if scheme == "" {
-							scheme = requestScheme(r)
+						if ref.Scheme != "" && !strings.EqualFold(ref.Scheme, requestScheme(r)) {
+							continue
 						}
+						host := r.Host
+						scheme := keyScheme(r)
 						fc.idx.purge(schemeKey(scheme, host, uri), "invalidate")
 						// Absolute-form requests (RequestURI carries the
 						// whole URI) store under host+full URI — purge that
@@ -922,6 +924,19 @@ func (s *statusRW) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	}
 
 	return h.Hijack()
+}
+
+// requestScheme is the scheme the client addressed: the absolute-form
+// request-target's when present, otherwise inferred from the connection.
+func requestScheme(r *http.Request) string {
+	if r.URL.Scheme != "" {
+		return r.URL.Scheme
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+
+	return "http"
 }
 
 // serveEntry writes a cached variant to the client. now is the timestamp
