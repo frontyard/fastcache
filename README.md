@@ -113,7 +113,7 @@ into the cache while streaming it to the client.
 | `status_ttl`                  | none                   | Per-status freshness cap: `status_ttl <code>... <duration>` (repeatable); bounds even explicit upstream freshness — `0` disables storing that status                                   |
 | `revalidate_timeout`          | `30s`                  | Bound on any single upstream revalidation — and on a fill whose client went away (`0` = unbounded)                                                                                       |
 | `lock_timeout`                | `30s`                  | How long a coalesced request may wait on an in-flight fill/revalidation (nginx `proxy_cache_lock_timeout`); on expiry it fetches upstream itself (`0` = unbounded)                      |
-| `cache_key`                   | `{host}{requestURI}`   | Cache key as a caddy placeholder template, e.g. `{http.request.host}{http.request.uri.path}`                                                                                             |
+| `cache_key`                   | `{scheme}://{host}{requestURI}` | Cache key as a caddy placeholder template, e.g. `{http.request.scheme}://{http.request.host}{http.request.uri.path}`                                                          |
 | `match_header`                | none                   | Store only responses whose header `<name>` equals one of the given values (repeatable)                                                                                                   |
 | `vary`                        | none                   | Whitelist of `Vary` header names to key on                                                                                                                                               |
 | `disable_touch_on_hit`        | off                    | Skip the LRU timestamp update on hits (rarely needed — the touch is a coarse atomic write)                                                                                               |
@@ -132,7 +132,7 @@ warning at provision.
 
 ```caddyfile
 # Key on path + one query param, ignoring all others
-cache_key {http.request.host}{http.request.uri.path}?lang={query.lang}
+cache_key {http.request.scheme}://{http.request.host}{http.request.uri.path}?lang={query.lang}
 
 # Cache only responses the upstream opted into
 match_header X-Cacheable yes true
@@ -268,8 +268,12 @@ retention window: an entry lives until `expiry + max(swr, sie)`.
   belongs to caddy's own route matchers; just place `fastcache` inside a
   `handle` block.)
 - **cache_key** accepts caddy placeholders resolved per request, e.g.
-  `cache_key {http.request.host}{http.request.uri.path}` to ignore the query
-  string, or add `{http.request.method}`/header values to split entries.
+  `cache_key {http.request.scheme}://{http.request.host}{http.request.uri.path}`
+  to ignore the query string, or add `{http.request.method}`/header values to
+  split entries. The default key includes the request scheme; a custom
+  template should include `{http.request.scheme}` too whenever one block
+  serves both HTTP and HTTPS — otherwise a scheme-dependent response (e.g. an
+  HTTP→HTTPS redirect) cached for one scheme is served for the other.
 - **Conditionals:** `If-None-Match` uses weak comparison (`W/"x"` matches
   `"x"`); `If-Match` uses strong comparison — a weak stored ETag satisfies
   nothing, `*` matches any stored entity, and a mismatch is a `412`.
@@ -338,7 +342,7 @@ otherwise be unreachable forever.
 
 ### On-disk format
 
-Each entry is a **body file plus a `.meta` sidecar** (magic `FCH2` — format
+Each entry is a **body file plus a `.meta` sidecar** (magic `FCH3` — format
 version; older-version metas are rejected and reaped at rebuild — length,
 gob-encoded headers/status/timestamps) under `path/<xx>/` — a 256-way shard
 derived from the key hash, so no single directory accumulates millions of

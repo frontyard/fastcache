@@ -29,10 +29,11 @@ import (
 )
 
 // fileMagic identifies cache entry files written by this plugin. FCH2
-// changed the varyKey encoding (length-prefixed, all header values); older
-// metas carry keys a lookup would never recompute, so they are rejected and
-// reaped at rebuild.
-var fileMagic = []byte{'F', 'C', 'H', '2'}
+// changed the varyKey encoding (length-prefixed, all header values); FCH3
+// prefixed the default base key with the request scheme. Older metas carry
+// keys a lookup would never recompute, so they are rejected and reaped at
+// rebuild.
+var fileMagic = []byte{'F', 'C', 'H', '3'}
 
 // metaHeader is the serialized sidecar for one entry (written to
 // <bodyfile>.meta). Keeping meta and body in separate files lets the body be
@@ -1168,10 +1169,26 @@ func (ix *index) purge(base, reason string) int {
 	return len(toDelete)
 }
 
-// baseKey is the cache key before the vary suffix: host + requestURI, or
-// the configured cache_key placeholder template when set.
+// baseKey is the cache key before the vary suffix: scheme://host +
+// requestURI, or the configured cache_key placeholder template when set.
+// The scheme keeps HTTP and HTTPS responses (e.g. an HTTP->HTTPS redirect)
+// from sharing an entry.
 func baseKey(r *http.Request) string {
-	return r.Host + r.RequestURI
+	return schemeKey(requestScheme(r), r.Host, r.RequestURI)
+}
+
+// schemeKey builds a default-format base key; every computed default key
+// (lookup, purge, invalidation) must go through it.
+func schemeKey(scheme, host, uri string) string {
+	return scheme + "://" + host + uri
+}
+
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+
+	return "http"
 }
 
 func (ix *index) baseKey(r *http.Request) string {
