@@ -9,6 +9,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"io/fs"
 	"maps"
@@ -61,7 +62,7 @@ type entry struct {
 	metaPath       string // sidecar meta file
 	size           int64  // body size
 	fileSize       int64  // body + meta, for disk accounting
-	purgeAt        uint64 // purgeSeq snapshot at capture start; commit aborts if it moved
+	purgeAt        uint64 // purgeGen(baseKey) snapshot at capture start; commit aborts if it moved
 	body           atomic.Pointer[[]byte]
 	headers        atomic.Pointer[http.Header]
 	storedAt       atomic.Int64
@@ -173,8 +174,9 @@ type index struct {
 	memSize   atomic.Int64
 	diskSize  atomic.Int64
 	fileCount atomic.Int64
-	fileSeq   atomic.Uint64 // unique suffix for body files; seeded from the wall clock
-	purgeSeq  atomic.Uint64 // bumped by every purge; in-flight captures compare
+	fileSeq   atomic.Uint64               // unique suffix for body files; seeded from the wall clock
+	purgeGens [purgeStripes]atomic.Uint64 // per-key-stripe purge generations; see purgeGen
+	purgeSeed maphash.Seed
 
 	expQueue  expiryHeap
 	heapMu    sync.Mutex
@@ -225,6 +227,7 @@ func newIndex(cfg *FastCache) *index {
 		sweepStop: make(chan struct{}),
 		metrics:   newCacheMetrics(cfg.Name),
 		logger:    cfg.logger,
+		purgeSeed: maphash.MakeSeed(),
 	}
 
 	// Seeding from the clock keeps file names unique across restarts: a
@@ -339,7 +342,7 @@ func (ix *index) commit(e *entry) {
 	// insert must not let the new entry resurrect just-removed content —
 	// re-verify before calling it committed. The dropFile covers the lost
 	// commit-race case too: our files are orphaned whichever way we lost.
-	if v, ok := ix.entries.Load(e.key); !ok || v != e || ix.purgeSeq.Load() != e.purgeAt {
+	if v, ok := ix.entries.Load(e.key); !ok || v != e || ix.purgeGen(e.baseKey).Load() != e.purgeAt {
 		if ce := ix.logger.Check(zap.DebugLevel, "commit aborted; entry raced a purge"); ce != nil {
 			ce.Write(zap.String("key", e.key))
 		}
@@ -1129,15 +1132,25 @@ func (ix *index) persistMeta(e *entry) {
 	}
 }
 
+// purgeStripes is the number of purge generation counters. Base keys hash
+// onto them with a per-process random seed, so a purge only aborts
+// in-flight captures of its own key (plus a ~1/purgeStripes collision
+// chance an outside client cannot aim at a chosen key).
+const purgeStripes = 4096
+
+// purgeGen returns the purge generation counter guarding base.
+func (ix *index) purgeGen(base string) *atomic.Uint64 {
+	return &ix.purgeGens[maphash.String(ix.purgeSeed, base)%purgeStripes]
+}
+
 // purge removes the whole variant set for a base key; reason feeds the
 // evictions_total metric ("purge" for explicit/admin purges, "invalidate"
 // for unsafe-method invalidation).
 func (ix *index) purge(base, reason string) int {
-	// Bump the generation first: a capture that began before this purge
-	// must not commit the just-purged content afterwards. One counter for
-	// all keys — a purge may also abort an unrelated in-flight store,
-	// which merely costs a re-fetch.
-	ix.purgeSeq.Add(1)
+	// Bump the key's generation first, even with no mapping yet: a capture
+	// for this key that began before the purge must not commit the
+	// just-purged content afterwards (first fills included).
+	ix.purgeGen(base).Add(1)
 
 	v, ok := ix.mappings.Load(base)
 	if !ok {

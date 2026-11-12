@@ -53,7 +53,7 @@ type captureWriter struct {
 	wrote    bool   // headers/body already committed to the client
 	swallow  bool   // a stale fallback was served; drop upstream output
 	hijacked bool   // downstream was hijacked mid-capture; never commit
-	purgeAt  uint64 // purgeSeq snapshot at capture start; a bump aborts the commit
+	purgeAt  uint64 // purgeGen(base) snapshot at capture start; a bump aborts the commit
 
 	// fallback is a stale entry to serve when upstream fails (stale_if_error).
 	fallback *entry
@@ -85,7 +85,7 @@ type captureWriter struct {
 
 func newCaptureWriter(fc *FastCache, rw http.ResponseWriter, r *http.Request, base string) *captureWriter {
 	cw := &captureWriter{ix: fc.idx, fc: fc, req: r, base: base, status: http.StatusOK, declared: -1,
-		hdr: http.Header{}, purgeAt: fc.idx.purgeSeq.Load()}
+		hdr: http.Header{}, purgeAt: fc.idx.purgeGen(base).Load()}
 	cw.rwP.Store(&rw)
 
 	return cw
@@ -415,7 +415,7 @@ func (cw *captureWriter) Close(handlerErr error) {
 	if handlerErr != nil || cw.failed || cw.hijacked ||
 		(cw.declared >= 0 && cw.declared != cw.bodySize) ||
 		cw.req.Context().Err() != nil ||
-		cw.ix.purgeSeq.Load() != cw.purgeAt {
+		cw.ix.purgeGen(cw.base).Load() != cw.purgeAt {
 		// A purge or unsafe-method invalidation raced this capture —
 		// committing now would resurrect just-purged content.
 		if ce := cw.fc.logger.Check(zap.DebugLevel, "discarding captured response"); ce != nil {

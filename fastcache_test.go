@@ -400,6 +400,60 @@ func TestPurgeAbortsInflightCommit(t *testing.T) {
 	}
 }
 
+// TestUnrelatedInvalidationKeepsInflightCommit: a successful unsafe request
+// on one URL must not abort an in-flight fill of a different URL —
+// otherwise a stream of cheap POSTs keeps anything from being stored.
+func TestUnrelatedInvalidationKeepsInflightCommit(t *testing.T) {
+	fc := newTestCache(t, nil)
+
+	var calls atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	slow := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("part1"))
+		close(started)
+		<-release
+		_, _ = w.Write([]byte("part2"))
+
+		return nil
+	})
+
+	ra := httptest.NewRequest(http.MethodGet, "http://example.com/a", nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = fc.ServeHTTP(httptest.NewRecorder(), ra, slow)
+	}()
+
+	<-started
+
+	ok := handlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+
+		return nil
+	})
+	for range 50 {
+		pr := httptest.NewRequest(http.MethodPost, "http://example.com/b", nil)
+		_ = fc.ServeHTTP(httptest.NewRecorder(), pr, ok)
+	}
+
+	close(release)
+	<-done
+
+	if _, _, found, _ := fc.idx.lookup(ra); !found {
+		t.Fatal("POST to /b aborted the in-flight fill of /a")
+	}
+
+	get(t, fc, "/a", nil, slow)
+	if calls.Load() != 1 {
+		t.Fatalf("expected /a served from cache, upstream calls=%d", calls.Load())
+	}
+}
+
 // TestMultiValuedHeaders: repeated Cache-Control and Vary field lines fold
 // per RFC 9110 §5.3 and must be parsed as one comma-joined value.
 func TestMultiValuedHeaders(t *testing.T) {
