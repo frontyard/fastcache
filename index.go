@@ -1065,11 +1065,25 @@ func (ix *index) rebuild() error {
 // the 304's header fields replace same-named stored fields, freshness
 // deadlines are recomputed, and the meta sidecar is rewritten so the update
 // survives a restart. The body file is untouched.
-func (ix *index) refresh304(e *entry, h http.Header) {
+//
+// The merged headers face the same storability rules as a full response:
+// when they carry no-store or private, or the 304 sets a cookie without
+// store_set_cookie, the entry is left untouched and false is returned with
+// the merged headers — the caller serves them to this client only and
+// drops the entry.
+func (ix *index) refresh304(e *entry, h http.Header) (http.Header, bool) {
 	old := *e.headers.Load()
 	merged := make(http.Header, len(old)+len(h))
 	maps.Copy(merged, old)
 	maps.Copy(merged, cacheableHeaders(h))
+
+	cc := responseCC(merged)
+	_, noStore := cc["no-store"]
+	_, private := cc["private"]
+	if noStore || private || (!ix.storeCookie && len(merged.Values("Set-Cookie")) > 0) {
+		return merged, false
+	}
+
 	e.headers.Store(&merged)
 
 	now := time.Now()
@@ -1086,6 +1100,8 @@ func (ix *index) refresh304(e *entry, h http.Header) {
 
 	ix.scheduleExpiry(e)
 	ix.persistMeta(e)
+
+	return merged, true
 }
 
 // persistMeta rewrites an entry's meta sidecar after an in-place update.

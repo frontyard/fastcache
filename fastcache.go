@@ -943,6 +943,12 @@ func requestScheme(r *http.Request) string {
 // pay for it again). cs holds RFC 9211 Cache-Status parameters describing
 // how the hit was reached (e.g. "hit", "fwd=stale", "collapsed").
 func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry, next caddyhttp.Handler, now int64, cs ...string) error {
+	return fc.serveEntryHeaders(w, r, e, *e.headers.Load(), next, now, cs...)
+}
+
+// serveEntryHeaders is serveEntry with the response headers supplied by the
+// caller instead of the entry's stored ones.
+func (fc *FastCache) serveEntryHeaders(w http.ResponseWriter, r *http.Request, e *entry, hdrs http.Header, next caddyhttp.Handler, now int64, cs ...string) error {
 	// RAM tier first; otherwise open the body file for sendfile.
 	var (
 		body *[]byte
@@ -975,7 +981,6 @@ func (fc *FastCache) serveEntry(w http.ResponseWriter, r *http.Request, e *entry
 
 	h := w.Header()
 
-	hdrs := *e.headers.Load()
 	maps.Copy(h, hdrs)
 
 	h["Cache-Status"] = []string{"fastcache; " + strings.Join(cs, "; ")}

@@ -131,7 +131,25 @@ func (cw *captureWriter) decide(status int) {
 	if status == http.StatusNotModified && cw.reval != nil && cw.ownVal {
 		cw.swallow = true
 		cw.merged304 = true
-		cw.ix.refresh304(cw.reval, cw.hdr)
+		merged, kept := cw.ix.refresh304(cw.reval, cw.hdr)
+		if !kept {
+			// The 304 made the entry unstorable (private, no-store, or a
+			// Set-Cookie): this client gets the body with the 304's headers,
+			// then the entry is dropped so nobody else is served them.
+			if ce := cw.fc.logger.Check(zap.DebugLevel, "304 made entry unstorable; dropping it"); ce != nil {
+				ce.Write(zap.String("key", cw.reval.key))
+			}
+			if serr := cw.fc.serveEntryHeaders(cw.writer(), serveReq, cw.reval, merged, cw.next,
+				time.Now().UnixNano(), "fwd=stale"); serr != nil {
+				if ce := cw.fc.logger.Check(zap.DebugLevel, "cannot serve revalidated entry"); ce != nil {
+					ce.Write(zap.String("key", cw.reval.key), zap.Error(serr))
+				}
+			}
+			cw.ix.deleteEntry(cw.reval)
+
+			return
+		}
+
 		if ce := cw.fc.logger.Check(zap.DebugLevel, "revalidated entry via 304 merge"); ce != nil {
 			ce.Write(zap.String("key", cw.reval.key))
 		}
